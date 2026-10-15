@@ -67,6 +67,11 @@ curl -s -H "$T" .../admin/tenants/acme/logs?limit=50                      # 登�
 
 ## 客户接入流程（BYO）
 
+客户侧图文文档在 [docs/](docs/README.md)：[① 钉钉建应用](docs/1-dingtalk-app.md) →
+[② CF ZT 五字段配置](docs/2-cloudflare-access.md) → [③ 排错对照表](docs/3-troubleshooting.md)。
+
+流程概要：
+
 1. 客户在[钉钉开放平台](https://open.dingtalk.com)建企业内部应用，开通「个人信息读取」权限，
    回调地址填 `https://<slug>.sso.<域名>/cb`
 2. 把 AppKey/AppSecret + 自己的 CF 团队回调地址交给运营（或自助控制台）建租户
