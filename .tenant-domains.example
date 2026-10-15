@@ -1,0 +1,1 @@
+# 每行一个租户主机名，如 acme.sso.example.com（追加用: bash deploy.sh --add-domain=<主机名>）

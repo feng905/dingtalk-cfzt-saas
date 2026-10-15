@@ -5,18 +5,24 @@
 
 > **仓库不含真实域名**。部署主域在运行时确定（交互输入 / `--domain=` 参数 /
 > 本地 `.deploy.env` 的 `DEPLOY_DOMAIN`），脚本据此生成本地 `wrangler.deploy.toml`
-> （gitignore）——真实域名、通配符路由、database_id 只存在于该文件，全程 `--config` 引用。
+> （gitignore）——真实域名、主机名路由、database_id 只存在于该文件，全程 `--config` 引用。
 > 下文用 `sso.example.com` 指代「你的服务子树」。
+
+> **为什么每租户一条精确主机名**：Cloudflare Custom Domains 不支持通配符
+> （`wrangler deploy` 会直接拒绝 `*.sso.…`）。每条路由是子树内一条完整主机名，
+> Cloudflare 自动创建 DNS 记录并自动签发证书——包括 `acme.sso.<主域>` 这类
+> 两级子域（Universal SSL 免费证书只覆盖一级，Custom Domain 不受限）。
+> 加租户 = 追加一条主机名重新部署：`bash deploy.sh --add-domain=<slug>.sso.<主域>`。
 
 ```
 ┌─ Cloudflare 账号（<部署主域> zone）────────────────────────────────┐
 │                                                                    │
 │  <主域下其他主机名>……（例如已有的 sso-dingtalk-proxy.<主域>）← 不动  │
 │                                                                    │
-│  *.sso.<部署主域>                                ← 本次部署占用     │
-│    ├─ acme.sso.…          每租户一个三级子域 = 该租户的 OIDC issuer  │
-│    ├─ deploy-check.sso.…  部署验证用（也可当管理控制台入口）         │
-│    └─ <任何slug>.sso.…                                             │
+│  sso.<部署主域> 子树（逐条精确注册，不用通配符）   ← 本次部署占用     │
+│    ├─ deploy-check.sso.…  验证入口 + 管理控制台（每次部署自动包含）   │
+│    ├─ acme.sso.…          每租户一条主机名 = 该租户的 OIDC issuer    │
+│    └─ <slug>.sso.…        加租户 = --add-domain 追加后重新部署        │
 │                                                                    │
 │  Worker: dingtalk-cfzt-saas（含落地页 public/index.html）           │
 │  D1:     dingtalk-saas（tenants / oidc_clients / signing_keys /     │
@@ -26,9 +32,10 @@
 
 ## 隔离保证（为什么不会影响其他域名）
 
-1. **子树零重叠**：通配符 `*.sso.<部署主域>` 只匹配「恰好多一层 `.sso.`」的主机名
-   （`acme.sso.…`）。主域下任何既有主机名（如 `sso-dingtalk-proxy.<主域>`）不在该子树内，
-   不是通配符更不更具体的问题——结构上就匹配不到。
+1. **只注册子树内的精确主机名**：服务注册的每一条路由都是 `sso.<部署主域>` 子树内的
+   完整主机名（如 `acme.sso.…`）。主域下任何既有主机名（如 `sso-dingtalk-proxy.<主域>`）
+   不在该子树内，结构上就匹配不到；追加租户也只是新增更深的子域主机名，
+   不会改动主域下任何一层既有主机名的 DNS 或路由。
 2. **部署按 Worker 隔离**：`wrangler deploy` 只上传/变更配置里 `name` 指定的这一个 Worker，
    其他 Worker 的代码、Secrets、自定义域都不会被触碰。
 3. **脚本前后回归比对**：`deploy.sh` 部署前记录 `sso-dingtalk-proxy.<主域>` 的基线
@@ -59,9 +66,9 @@ bash deploy.sh --domain=example.com  # 非交互指定主域
 | 1 D1 | 确认建库 | `d1 list` 查重 → 不存在则 `d1 create`；生成 `wrangler.deploy.toml`（真实域+database_id） |
 | 2 建表 | 确认执行 | `d1 execute DB --config … --remote --file=schema.sql`（全部 `IF NOT EXISTS`，可重复跑） |
 | 3 Secrets | 展示一次 + 确认写入 | 生成 ENCRYPTION_KEY / STATE_SECRET / ADMIN_TOKEN，备份到 `.secrets/production/`（已 gitignore），逐个 `secret put --config …`；已存在的默认保留 |
-| 4 部署 | 最终确认 | `wrangler deploy --config wrangler.deploy.toml`（创建通配符自定义域，证书自动签发） |
+| 4 部署 | 最终确认 | `wrangler deploy --config wrangler.deploy.toml`（注册 deploy-check 入口与各租户主机名的 Custom Domain，DNS+证书自动签发） |
 | 5 验证 | 无（自动） | 新域名 /health、discovery issuer、/admin 401；老 Worker 两项回归比对 |
-| 附加 | 可跳过 | 可选：现场创建第一个租户，打印 client_id/secret 和 CF Access 五字段 |
+| 附加 | 可跳过 | 可选：现场创建第一个租户，打印 client_id/secret 和 CF Access 五字段；确认后自动把其主机名加入路由并重新部署 |
 
 Secrets 只在生成时展示一次，之后保存在 `.secrets/production/`（权限 600），脚本不会回显。
 
@@ -120,6 +127,19 @@ curl -X POST https://deploy-check.sso.example.com/admin/tenants \
 响应里的 `client_id`/`client_secret` 只出现这一次，交给客户按 [docs/2-cloudflare-access.md](2-cloudflare-access.md) 填五字段。
 也可以打开 `https://deploy-check.sso.example.com/admin/` 用浏览器控制台操作（登录用 ADMIN_TOKEN）。
 
+### 开通租户主机名路由
+
+租户创建后，其入口 `<slug>.sso.<主域>` 还需注册为 Custom Domain 才能解析（自动建 DNS + 签发证书）：
+
+```bash
+bash deploy.sh --add-domain=acme.sso.example.com
+```
+
+脚本会校验主机名在 `sso.<主域>` 子树内、追加到本地 `.tenant-domains`（gitignore）、
+重新部署并轮询 `/health` 直到证书就绪。deploy.sh 创建租户时也会询问是否当场做这一步。
+
+## 日常运维
+
 ## 日常运维
 
 | 操作 | 命令 |
@@ -134,7 +154,8 @@ curl -X POST https://deploy-check.sso.example.com/admin/tenants \
 ## 常见问题
 
 - **`wrangler secret put` 报 Required Worker name missing**：不在仓库根目录运行。回到本目录，或脚本内部已处理。
-- **部署后新域名 5xx/证书错误**：通配符证书签发需要几十秒，脚本会自动重试等待；持续失败查 Cloudflare 控制台 SSL/TLS。
+- **部署后新域名 5xx/证书错误**：Custom Domain 的 DNS 与证书签发需要几十秒到几分钟，脚本会轮询等待；持续失败查 Cloudflare 控制台 SSL/TLS → Custom Hostnames。
+- **为什么不能用通配符域名**：Cloudflare Custom Domains 明确不支持 `*`（wrangler 直接拒绝）；Workers 通配符 Routes 又需要每主机名手工建 DNS 记录，且两级子域（`acme.sso.…`）不在 Universal SSL 免费证书覆盖内，需付费 Total TLS/ACM。所以按租户逐条注册精确 Custom Domain 是唯一免费且自动化的路径。
 - **直接 `wrangler deploy`（不带 --config）会怎样**：用的是模板 `wrangler.toml`（占位域 example.com、占位 database_id），部署会失败或落在 workers.dev——所以仓库里 `npm run deploy` 已指向 `deploy.sh`，别绕过。
 - **换部署主域**：重新跑 `deploy.sh` 输入新主域即可生成新配置；旧域的自定义域路由需在 CF 控制台删掉，且已建租户的 issuer 会变，客户 CF 配置要同步改。
-- **`.deploy.env` / `wrangler.deploy.toml` / `.secrets/`**：三者都已 gitignore，真实域名与密钥只存在于本机。
+- **`.deploy.env` / `wrangler.deploy.toml` / `.tenant-domains` / `.secrets/`**：都已 gitignore，真实域名与密钥只存在于本机。

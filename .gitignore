@@ -6,3 +6,4 @@ node_modules/
 .DS_Store
 .deploy.env
 wrangler.deploy.toml
+.tenant-domains

@@ -7,12 +7,15 @@
 #   bash deploy.sh --dry-run     只读预演：检查环境、展示计划，不做任何变更
 #   bash deploy.sh --yes         跳过全部确认（配合 CI；慎用）
 #   bash deploy.sh --domain=x.y  非交互指定部署主域（跳过域名输入）
+#   bash deploy.sh --add-domain=<主机名>   追加租户路由主机名并重新部署
 #   bash deploy.sh --help        帮助
 #
 # 域名机制（仓库不含真实域名）:
-#   部署主域在运行时输入（或 --domain= / 本地 .deploy.env 的 DEPLOY_DOMAIN 提供），
-#   服务占用 sso.<主域> 子树；脚本据此生成 wrangler.deploy.toml（gitignore），
-#   真实域名、通配符路由、database_id 只存在于该本地文件，再以 --config 部署。
+#   部署主域运行时确定（交互 / --domain= / 本地 .deploy.env）。服务主机名全部在
+#   sso.<主域> 子树内；Custom Domains 不支持通配符（wrangler 直接拒绝 *），
+#   因此每个主机名单独注册为 Custom Domain——Cloudflare 自动建 DNS 并自动签发
+#   证书（含 acme.sso.<主域> 这类多级子域）。真实域名只存在于本地生成的
+#   wrangler.deploy.toml（gitignore），全程 --config 部署。
 #
 # 部署内容:
 #   1. D1 数据库 dingtalk-saas（不存在则创建，id 写入本地生成的配置）
@@ -20,9 +23,9 @@
 #   3. 三个生产 Secret（ENCRYPTION_KEY / STATE_SECRET / ADMIN_TOKEN），
 #      本地备份到 .secrets/production/（已 gitignore）；已存在的默认保留
 #   4. wrangler deploy --config wrangler.deploy.toml
-#      —— 只占用 sso.<主域> 子树，不影响主域下其他任何主机名
+#      —— 注册 deploy-check.sso.<主域> 与各租户主机名，不影响主域下其他主机名
 #   5. 部署后验证 + 同主域既有 Worker（sso-dingtalk-proxy.<主域>）回归比对
-#   6. （可选）创建第一个租户
+#   6. （可选）创建第一个租户并追加其主机名路由
 #
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -45,13 +48,15 @@ DEPLOY_ENV=".deploy.env"
 DRY_RUN=0
 ASSUME_YES=0
 DOMAIN=""
+ADD_DOMAIN=""
 for ARG in "$@"; do
   case "$ARG" in
-    --dry-run)   DRY_RUN=1 ;;
-    --yes)       ASSUME_YES=1 ;;
-    --domain=*)  DOMAIN=$(printf '%s' "${ARG#--domain=}" | tr '[:upper:]' '[:lower:]' | tr -d ' ') ;;
-    -h|--help)   sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) printf '未知参数: %s\n\n' "$ARG"; sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    --dry-run)        DRY_RUN=1 ;;
+    --yes)            ASSUME_YES=1 ;;
+    --domain=*)       DOMAIN=$(printf '%s' "${ARG#--domain=}" | tr '[:upper:]' '[:lower:]' | tr -d ' ') ;;
+    --add-domain=*)   ADD_DOMAIN=$(printf '%s' "${ARG#--add-domain=}" | tr '[:upper:]' '[:lower:]' | tr -d ' ') ;;
+    -h|--help)        sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf '未知参数: %s\n\n' "$ARG"; sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
   esac
 done
 
@@ -102,26 +107,54 @@ run() { # run cmd... —— dry-run 时只打印
   "$@"
 }
 
+retry() { # retry "描述" cmd... —— 联网命令自动重试（网络抖动常见），最多 3 次
+  local DESC="$1" N=0
+  shift
+  while :; do
+    if "$@"; then
+      return 0
+    fi
+    N=$((N + 1))
+    if [ "$N" -ge 3 ]; then
+      die "${DESC} 重试 3 次仍失败（多为网络问题；稍后重跑 bash deploy.sh 即可，已完成步骤会自动跳过）"
+    fi
+    warn "${DESC} 失败（第 ${N} 次），10 秒后自动重试（Ctrl+C 可退出）"
+    sleep 10
+  done
+}
+
 http_code() {
   curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || printf '000'
 }
 
-# 生成 <root:wrangler.deploy.toml>（本地部署配置：真实域 + database_id，gitignore）
+# 生成 <root:wrangler.deploy.toml>（本地部署配置：真实域 + 路由 + database_id，gitignore）
 gen_deploy_config() { # gen_deploy_config <database_id>
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] 将生成 ${DEPLOY_CFG}（子树 ${BASE_DOMAIN}，database_id ${1}）"
+    info "[dry-run] 将生成 ${DEPLOY_CFG}（deploy-check.${BASE_DOMAIN} + .tenant-domains 中的主机名，database_id ${1}）"
     return 0
   fi
   CFG_BASE="$BASE_DOMAIN" CFG_ID="$1" python3 - <<'PYEOF'
 import os, re
+base = os.environ['CFG_BASE']
+extra = []
+if os.path.exists('.tenant-domains'):
+    with open('.tenant-domains', encoding='utf-8') as f:
+        extra = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
+check = 'deploy-check.' + base
+routes = ['{ pattern = "%s", custom_domain = true }' % check]
+for h in extra:
+    if h != check and all(h not in r for r in routes):
+        routes.append('{ pattern = "%s", custom_domain = true }' % h)
 s = open('wrangler.toml', encoding='utf-8').read()
-s = s.replace('sso.example.com', os.environ['CFG_BASE'])
+s = s.replace('sso.example.com', base)
+s = re.sub(r'(?m)^# ROUTES_PLACEHOLDER.*$',
+           'routes = [\n  ' + ',\n  '.join(routes) + '\n]', s, count=1)
 s = re.sub(r'(database_id\s*=\s*)"[^"]*"',
            lambda m: m.group(1) + '"' + os.environ['CFG_ID'] + '"', s, count=1)
 open('wrangler.deploy.toml', 'w', encoding='utf-8').write(s)
 PYEOF
   chmod 600 "$DEPLOY_CFG" 2>/dev/null || true
-  ok "已生成本地部署配置 ${DEPLOY_CFG}（真实域名与 database_id 只存在于此文件，不入库）"
+  ok "已生成本地部署配置 ${DEPLOY_CFG}（真实域名、路由与 database_id 只存在于此文件，不入库）"
 }
 
 # ══════════════════════ 预检 ══════════════════════
@@ -132,10 +165,14 @@ command -v curl     >/dev/null 2>&1 || die "未找到 curl"
 command -v openssl  >/dev/null 2>&1 || die "未找到 openssl"
 command -v lsof     >/dev/null 2>&1 || die "未找到 lsof"
 info "wrangler $(wrangler --version 2>/dev/null | tr -d ' \n')"
-if ! wrangler whoami >/dev/null 2>&1; then
-  die "wrangler 未登录。请先运行: npx wrangler login"
+WHOAMI_TMP=$(mktemp)
+retry "wrangler 登录检查" wrangler whoami >"$WHOAMI_TMP" 2>/dev/null
+if ! grep -q "logged in" "$WHOAMI_TMP"; then
+  rm -f "$WHOAMI_TMP"
+  die "wrangler 未登录（或连不上 api.cloudflare.com）。请先: npx wrangler login；已登录则稍后重跑"
 fi
-wrangler whoami 2>/dev/null | sed -n '1,10p'
+sed -n '1,10p' "$WHOAMI_TMP"
+rm -f "$WHOAMI_TMP"
 [ -f public/index.html ] || die "缺少 public/index.html（落地页）"
 [ -f schema.sql ]        || die "缺少 schema.sql"
 [ -f wrangler.toml ]     || die "缺少 wrangler.toml"
@@ -160,11 +197,51 @@ if ! printf '%s' "$DOMAIN" | grep -Eq '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]
 fi
 BASE_DOMAIN="$SVC_PREFIX.$DOMAIN"
 PROXY_HOST="$LEGACY_PROXY_PREFIX.$DOMAIN"
-info "服务将占用: *.${BASE_DOMAIN}   （仅此一层子树）"
+info "服务子树:   ${BASE_DOMAIN}（其下主机名逐条注册为精确 Custom Domain）"
 if [ "$DOMAIN" != "$ENV_DOMAIN" ] && [ "$DRY_RUN" != "1" ]; then
   umask 077
   printf 'DEPLOY_DOMAIN=%s\n' "$DOMAIN" > "$DEPLOY_ENV"
   ok "已记住到本地 ${DEPLOY_ENV}（gitignore，下次运行直接回车）"
+fi
+
+# ══════════ 子命令：--add-domain（追加租户主机名路由并重新部署） ══════════
+if [ -n "$ADD_DOMAIN" ]; then
+  DOMAIN_ESC=$(printf '%s' "$DOMAIN" | sed 's/\./\\./g')
+  if ! printf '%s' "$ADD_DOMAIN" | grep -Eq "^([a-z0-9][a-z0-9-]{0,31})\.sso\.${DOMAIN_ESC}$"; then
+    die "主机名须形如 <slug>.sso.${DOMAIN}，收到: ${ADD_DOMAIN}"
+  fi
+  touch .tenant-domains
+  if grep -qx "$ADD_DOMAIN" .tenant-domains; then
+    ok "$ADD_DOMAIN 已在 .tenant-domains 中，无需追加"
+  else
+    printf '%s\n' "$ADD_DOMAIN" >> .tenant-domains
+    ok "已追加 $ADD_DOMAIN 到 .tenant-domains"
+  fi
+  REMOTE_ID=$(wrangler d1 list --json 2>/dev/null | DB_NAME="$DB_NAME" python3 -c '
+import json, sys, os
+try: lst = json.load(sys.stdin)
+except Exception: lst = []
+print(next((d.get("uuid", "") for d in lst if d.get("name") == os.environ["DB_NAME"]), ""))
+') || REMOTE_ID=""
+  [ -n "$REMOTE_ID" ] || die "D1 $DB_NAME 不存在，请先完整运行一次 bash deploy.sh"
+  gen_deploy_config "$REMOTE_ID"
+  confirm "部署以启用 ${ADD_DOMAIN}？[Y/n] " || die "已取消"
+  retry "部署" wrangler deploy --config "$DEPLOY_CFG"
+  info "等待主机名生效（DNS 与证书签发约需几十秒）..."
+  ADD_CODE="000"
+  ADDI=0
+  while [ $ADDI -lt 12 ]; do
+    ADD_CODE=$(http_code "https://$ADD_DOMAIN/health")
+    [ "$ADD_CODE" = "200" ] && break
+    ADDI=$((ADDI + 1))
+    sleep 5
+  done
+  if [ "$ADD_CODE" = "200" ]; then
+    ok "$ADD_DOMAIN 已就绪（/health → 200）"
+  else
+    warn "$ADD_DOMAIN 尚未就绪（health → ${ADD_CODE}）；DNS/证书最长可能要几分钟，稍后手动 curl 验证"
+  fi
+  exit 0
 fi
 
 # ══════════════════════ 基线 + 计划 ══════════════════════
@@ -177,9 +254,9 @@ if [ "$OLD_AUTH" = "302" ];   then ok "老 Worker /auth → ${OLD_AUTH}（路线
 printf '\n'
 info "部署计划:"
 printf '  Worker:    %s\n' "$WORKER_NAME"
-printf '  占用域名:  *.%s   （通配符自定义域，仅此一层子树）\n' "$BASE_DOMAIN"
+printf '  注册主机名: deploy-check.%s + .tenant-domains 中的租户域\n' "$BASE_DOMAIN"
+printf '             （每租户一条精确 Custom Domain，CF 自动建 DNS 并签发证书）\n'
 printf '  数据库:    D1 %s\n' "$DB_NAME"
-printf '  落地页:    https://%s/\n' "$BASE_DOMAIN"
 printf '  本地配置:  %s（gitignore；仓库文件不含真实域名）\n' "$DEPLOY_CFG"
 printf '  不触碰:    %s 等主域下其他主机名\n' "$PROXY_HOST"
 printf '\n'
@@ -203,7 +280,7 @@ else
       info "[dry-run] wrangler d1 create $DB_NAME"
       REMOTE_ID="<创建后自动填入>"
     else
-      OUT=$(wrangler d1 create "$DB_NAME" 2>&1) || { printf '%s\n' "$OUT" >&2; die "创建 D1 失败"; }
+      OUT=$(retry "创建 D1" wrangler d1 create "$DB_NAME" 2>&1) || { printf '%s\n' "$OUT" >&2; die "创建 D1 失败"; }
       REMOTE_ID=$(printf '%s' "$OUT" | grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)
       [ -n "$REMOTE_ID" ] || { printf '%s\n' "$OUT" >&2; die "无法解析 database_id"; }
       ok "已创建 D1（${REMOTE_ID}）"
@@ -216,9 +293,13 @@ gen_deploy_config "$REMOTE_ID"
 
 # ══════════════════════ 2/5 建表 ══════════════════════
 stage "2/5 远程建表"
-info "wrangler d1 execute DB --remote --file=schema.sql（全部 IF NOT EXISTS，可重复执行）"
+info "wrangler d1 execute DB --config ${DEPLOY_CFG} --remote --file=schema.sql（全部 IF NOT EXISTS，可重复执行）"
 confirm "在远程 D1 上执行建表？[Y/n] " || die "已取消"
-run wrangler d1 execute DB --config "$DEPLOY_CFG" --remote --file=schema.sql -y
+if [ "$DRY_RUN" = "1" ]; then
+  info "[dry-run] wrangler d1 execute DB --config $DEPLOY_CFG --remote --file=schema.sql -y"
+else
+  retry "远程建表" wrangler d1 execute DB --config "$DEPLOY_CFG" --remote --file=schema.sql -y
+fi
 
 # ══════════════════════ 3/5 Secrets ══════════════════════
 stage "3/5 生产 Secrets"
@@ -258,13 +339,26 @@ gen_and_put() { # gen_and_put <NAME>
     return 0
   fi
   if confirm "把 $NAME 设置到 Worker？[Y/n] "; then
-    if wrangler secret put "$NAME" --config "$DEPLOY_CFG" < "$F" >/dev/null 2>&1; then
+    # 不用 retry()：重定向的密钥文件 offset 会共享，重试时 wrangler 会读到空值；这里每次尝试重新打开文件
+    local PUT_OK=0 TRY=0
+    while [ "$TRY" -lt 3 ]; do
+      if wrangler secret put "$NAME" --config "$DEPLOY_CFG" < "$F" >/dev/null; then
+        PUT_OK=1
+        break
+      fi
+      TRY=$((TRY + 1))
+      if [ "$TRY" -lt 3 ]; then
+        warn "设置 $NAME 失败（第 ${TRY} 次），10 秒后重试（Ctrl+C 可退出）"
+        sleep 10
+      fi
+    done
+    if [ "$PUT_OK" = "1" ]; then
       ok "$NAME 已设置到 $WORKER_NAME"
     else
-      die "wrangler secret put $NAME 失败（可手动重试: wrangler secret put $NAME < ${F}）"
+      die "wrangler secret put $NAME 失败（可手动重试: wrangler secret put $NAME --config $DEPLOY_CFG < ${F}）"
     fi
   else
-    warn "已跳过。稍后手动: wrangler secret put $NAME < ${F}"
+    warn "已跳过。稍后手动: wrangler secret put $NAME --config $DEPLOY_CFG < ${F}"
   fi
 }
 
@@ -291,9 +385,13 @@ fi
 if [ "$DRY_RUN" != "1" ] && [ ! -f "$DEPLOY_CFG" ]; then
   die "缺少本地配置 ${DEPLOY_CFG}（D1 阶段应已生成）"
 fi
-info "wrangler deploy —— 将创建/更新自定义域 *.${BASE_DOMAIN}"
+info "wrangler deploy —— 将注册 deploy-check.${BASE_DOMAIN} 及租户主机名的自定义域"
 confirm "执行部署？[Y/n] " || die "已取消"
-run wrangler deploy --config "$DEPLOY_CFG"
+if [ "$DRY_RUN" = "1" ]; then
+  info "[dry-run] wrangler deploy --config $DEPLOY_CFG"
+else
+  retry "部署" wrangler deploy --config "$DEPLOY_CFG"
+fi
 
 # ══════════════════════ 5/5 验证 ══════════════════════
 stage "5/5 部署后验证"
@@ -425,6 +523,31 @@ except Exception: print("")
     printf '    Token URL:      https://%s.%s/token\n' "$SLUG" "$BASE_DOMAIN"
     printf '    Certificate URL: https://%s.%s/jwks\n' "$SLUG" "$BASE_DOMAIN"
     printf '    （PKCE 不开；完整步骤见 docs/2-cloudflare-access.md）\n'
+    TENANT_HOST="${SLUG}.${BASE_DOMAIN}"
+    if confirm "把租户主机名加入路由并重新部署？（不加入则该域名无法解析）[Y/n] "; then
+      touch .tenant-domains
+      if grep -qx "$TENANT_HOST" .tenant-domains; then
+        ok "${TENANT_HOST} 已在路由中"
+      else
+        printf '%s\n' "$TENANT_HOST" >> .tenant-domains
+        info "已追加 ${TENANT_HOST}，重新部署..."
+        retry "部署" wrangler deploy --config "$DEPLOY_CFG"
+        info "等待生效（DNS 与证书签发约需几十秒）..."
+        TH_CODE="000"
+        THI=0
+        while [ $THI -lt 12 ]; do
+          TH_CODE=$(http_code "https://$TENANT_HOST/health")
+          [ "$TH_CODE" = "200" ] && break
+          THI=$((THI + 1))
+          sleep 5
+        done
+        if [ "$TH_CODE" = "200" ]; then
+          ok "租户入口已就绪: https://${TENANT_HOST}"
+        else
+          warn "主机名尚未生效（health → ${TH_CODE}），稍后可重跑 bash deploy.sh --add-domain=${TENANT_HOST} 验证"
+        fi
+      fi
+    fi
   else
     warn "创建失败或返回异常（见上方原始响应）"
     return 1

@@ -2,10 +2,15 @@
 #
 # ⚠️ 正式部署不要直接 `wrangler deploy` 本文件：
 #    用 ./deploy.sh（交互式输入部署主域，自动在本地生成 wrangler.deploy.toml ——
-#    已 gitignore，内含真实域名、通配符路由和 database_id —— 再以 --config 部署）。
+#    已 gitignore，内含真实域名、路由和 database_id —— 再以 --config 部署）。
 #
-# 隔离设计：服务只占用 sso.<部署主域> 子树（通配符自定义域，覆盖一层标签，
-# 即 acme.sso.<部署主域> 这类三级主机名），不影响主域下其他任何主机名。
+# 路由架构：Custom Domains 不支持通配符（wrangler 会直接拒绝 *），因此采用
+# 「每租户一条精确主机名」—— Cloudflare 自动创建 DNS 记录并自动签发证书
+# （含 acme.sso.<主域> 这类多级子域，Universal SSL 只覆盖一级，Custom Domain 不受限）：
+#   - deploy-check.sso.<主域> ：管理与验证入口，每次部署自动包含
+#   - 各租户主机名：记录在本机 .tenant-domains（bash deploy.sh --add-domain=<主机名> 追加）
+#
+# 隔离设计：只注册 sso.<部署主域> 子树内的精确主机名，不影响主域下其他任何主机名。
 #
 # 手工步骤见 docs/deploy.md。
 
@@ -13,14 +18,11 @@ name = "dingtalk-cfzt-saas"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+# ROUTES_PLACEHOLDER —— deploy.sh 生成配置时替换为真实 routes 数组
+
 # 落地页等静态文件（/ 由 public/index.html 提供，其余路径走 Worker）
 [assets]
 directory = "./public"
-
-routes = [
-  # 模板占位（example.com 非真实域）；deploy.sh 生成的本地配置会替换成 *.<真实子树>
-  { pattern = "*.sso.example.com", custom_domain = true }
-]
 
 [vars]
 # 租户子域名根域：<slug>.sso.<部署主域> → 该租户的 issuer

@@ -45,8 +45,13 @@ bash deploy.sh             # 正式部署（全程交互确认）
 **仓库不含真实域名**：部署主域在运行时输入（或 `--domain=`，或本地 `.deploy.env`），
 服务占用 `sso.<部署主域>` 子树，**不影响**主域下其他任何主机名
 （同主域既有 Worker 会被脚本做部署前后回归比对）。脚本据此生成本地
-`wrangler.deploy.toml`（gitignore，内含真实域名、通配符路由、database_id）再以
+`wrangler.deploy.toml`（gitignore，内含真实域名、主机名路由、database_id）再以
 `--config` 部署——直接 `wrangler deploy` 本仓库只会拿到占位符配置。
+
+**路由按租户逐条注册**：Custom Domains 不支持通配符，每个主机名
+（`deploy-check.sso.<主域>` 管理入口 + 各租户 `<slug>.sso.<主域>`）单独注册为
+Custom Domain，Cloudflare 自动建 DNS 并签发证书（两级子域也免费覆盖）。
+加租户：`bash deploy.sh --add-domain=<slug>.sso.<主域>`。
 完整步骤、手工等价命令、运维操作见 [docs/deploy.md](docs/deploy.md)。
 
 > 管理面当前只挡 ADMIN_TOKEN；上生产建议在 CF 侧再给 `/admin/*` 套一层 Access 自保护。
