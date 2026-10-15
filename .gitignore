@@ -4,3 +4,5 @@ node_modules/
 .secrets/
 *.log
 .DS_Store
+.deploy.env
+wrangler.deploy.toml

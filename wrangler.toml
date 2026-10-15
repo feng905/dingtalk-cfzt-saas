@@ -1,11 +1,12 @@
-# SaaS 版配置 — 生产域：sso.eastasia-gcr-nfr.cftenant.com 子树
+# SaaS 版配置 —— 本文件是「模板」，不含任何真实域名。
 #
-# 隔离说明（重要）：
-#   本 Worker 只占用 *.sso.eastasia-gcr-nfr.cftenant.com（通配符自定义域，覆盖一层标签，
-#   即 acme.sso.eastasia-gcr-nfr.cftenant.com 这类三级主机名）。
-#   现有 sso-dingtalk-proxy.eastasia-gcr-nfr.cftenant.com 不在该子树内，结构上零重叠。
+# ⚠️ 正式部署不要直接 `wrangler deploy` 本文件：
+#    用 ./deploy.sh（交互式输入部署主域，自动在本地生成 wrangler.deploy.toml ——
+#    已 gitignore，内含真实域名、通配符路由和 database_id —— 再以 --config 部署）。
 #
-# 首次部署用 ./deploy.sh（交互式，自动完成 D1 建库/建表/Secrets/部署/验证）。
+# 隔离设计：服务只占用 sso.<部署主域> 子树（通配符自定义域，覆盖一层标签，
+# 即 acme.sso.<部署主域> 这类三级主机名），不影响主域下其他任何主机名。
+#
 # 手工步骤见 docs/deploy.md。
 
 name = "dingtalk-cfzt-saas"
@@ -17,13 +18,14 @@ compatibility_date = "2026-09-01"
 directory = "./public"
 
 routes = [
-  # 通配符只覆盖 *.sso 子树，一个标签层；不影响同域其他主机名
-  { pattern = "*.sso.eastasia-gcr-nfr.cftenant.com", custom_domain = true }
+  # 模板占位（example.com 非真实域）；deploy.sh 生成的本地配置会替换成 *.<真实子树>
+  { pattern = "*.sso.example.com", custom_domain = true }
 ]
 
 [vars]
-# 租户子域名根域：<slug>.sso.eastasia-gcr-nfr.cftenant.com → 该租户的 issuer
-SSO_BASE_DOMAIN = "sso.eastasia-gcr-nfr.cftenant.com"
+# 租户子域名根域：<slug>.sso.<部署主域> → 该租户的 issuer
+# （本文件保留 example.com 供本地 e2e 使用；.dev.vars 同样是 sso.example.com）
+SSO_BASE_DOMAIN = "sso.example.com"
 # 钉钉 API 基址（本地测试被 .dev.vars 覆盖为 mock）
 DT_API_BASE = "https://api.dingtalk.com"
 DT_LOGIN_BASE = "https://login.dingtalk.com"
@@ -33,4 +35,5 @@ DEV_TENANT = "demo"
 [[d1_databases]]
 binding = "DB"
 database_name = "dingtalk-saas"
+# 模板占位；deploy.sh 运行时会查出/创建真实 database_id 写入本地生成的配置
 database_id = "PLACEHOLDER_DEPLOY_SCRIPT_WILL_FILL"

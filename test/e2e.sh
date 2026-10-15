@@ -21,13 +21,15 @@ cleanup() {
   # 杀掉 npx 父进程后 workerd 子进程可能存活并占着 8787（拿着已删除的旧库句柄）——补刀
   sleep 1
   lsof -ti:8787 2>/dev/null | xargs kill -9 2>/dev/null
+  lsof -ti:9901 2>/dev/null | xargs kill -9 2>/dev/null
   true
 }
 trap cleanup EXIT
 
 echo "▶ 0. 重置本地 D1 并建表"
-# 清掉上次运行可能残留的孤儿 dev 进程（否则健康检查打到旧实例上，全部断言失真）
+# 清掉上次运行可能残留的孤儿 dev/mock 进程（否则健康检查打到旧实例上，全部断言失真）
 lsof -ti:8787 2>/dev/null | xargs kill -9 2>/dev/null
+lsof -ti:9901 2>/dev/null | xargs kill -9 2>/dev/null
 sleep 1
 rm -rf .wrangler/state
 npx wrangler d1 execute DB --local --file=schema.sql >/dev/null 2>&1 || { echo "schema 失败"; exit 1; }
