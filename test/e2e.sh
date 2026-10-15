@@ -15,10 +15,20 @@ check(){ if [ "$2" = "$3" ]; then ok "$1 ($2)"; else bad "$1: got [$2] want [$3]
 jqval() { python3 -c "import json,sys;d=json.load(sys.stdin);print(d$1)" 2>/dev/null; }
 loc()   { grep -i '^location:' | head -1 | sed 's/^[Ll]ocation: //' | tr -d '\r'; }
 
-cleanup() { [ -n "${MOCK_PID:-}" ] && kill $MOCK_PID 2>/dev/null; [ -n "${WRANGLER_PID:-}" ] && kill $WRANGLER_PID 2>/dev/null; }
+cleanup() {
+  [ -n "${MOCK_PID:-}" ] && kill $MOCK_PID 2>/dev/null
+  [ -n "${WRANGLER_PID:-}" ] && kill $WRANGLER_PID 2>/dev/null
+  # 杀掉 npx 父进程后 workerd 子进程可能存活并占着 8787（拿着已删除的旧库句柄）——补刀
+  sleep 1
+  lsof -ti:8787 2>/dev/null | xargs kill -9 2>/dev/null
+  true
+}
 trap cleanup EXIT
 
 echo "▶ 0. 重置本地 D1 并建表"
+# 清掉上次运行可能残留的孤儿 dev 进程（否则健康检查打到旧实例上，全部断言失真）
+lsof -ti:8787 2>/dev/null | xargs kill -9 2>/dev/null
+sleep 1
 rm -rf .wrangler/state
 npx wrangler d1 execute DB --local --file=schema.sql >/dev/null 2>&1 || { echo "schema 失败"; exit 1; }
 

@@ -1,19 +1,30 @@
-# SaaS 版配置
-# 生产部署前：
-#   1. SSO_BASE_DOMAIN 换成真实域名，并加通配符自定义域：
-#      routes = [{ pattern = "*.sso.<你的域名>", custom_domain = true }]
-#   2. wrangler d1 create dingtalk-saas → 把 database_id 填进来
-#   3. wrangler d1 execute DB --remote --file=schema.sql
-#   4. wrangler secret put ENCRYPTION_KEY / ADMIN_TOKEN / STATE_SECRET
+# SaaS 版配置 — 生产域：sso.eastasia-gcr-nfr.cftenant.com 子树
+#
+# 隔离说明（重要）：
+#   本 Worker 只占用 *.sso.eastasia-gcr-nfr.cftenant.com（通配符自定义域，覆盖一层标签，
+#   即 acme.sso.eastasia-gcr-nfr.cftenant.com 这类三级主机名）。
+#   现有 sso-dingtalk-proxy.eastasia-gcr-nfr.cftenant.com 不在该子树内，结构上零重叠。
+#
+# 首次部署用 ./deploy.sh（交互式，自动完成 D1 建库/建表/Secrets/部署/验证）。
+# 手工步骤见 docs/deploy.md。
 
 name = "dingtalk-cfzt-saas"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+# 落地页等静态文件（/ 由 public/index.html 提供，其余路径走 Worker）
+[assets]
+directory = "./public"
+
+routes = [
+  # 通配符只覆盖 *.sso 子树，一个标签层；不影响同域其他主机名
+  { pattern = "*.sso.eastasia-gcr-nfr.cftenant.com", custom_domain = true }
+]
+
 [vars]
-# 租户子域名根域：<slug>.<SSO_BASE_DOMAIN> 解析为该租户的 issuer
-SSO_BASE_DOMAIN = "sso.example.com"
-# 钉钉 API 基址（测试时被 mock 覆盖）
+# 租户子域名根域：<slug>.sso.eastasia-gcr-nfr.cftenant.com → 该租户的 issuer
+SSO_BASE_DOMAIN = "sso.eastasia-gcr-nfr.cftenant.com"
+# 钉钉 API 基址（本地测试被 .dev.vars 覆盖为 mock）
 DT_API_BASE = "https://api.dingtalk.com"
 DT_LOGIN_BASE = "https://login.dingtalk.com"
 # 本地开发默认租户（仅 hostname 为 localhost 时生效）
@@ -22,4 +33,4 @@ DEV_TENANT = "demo"
 [[d1_databases]]
 binding = "DB"
 database_name = "dingtalk-saas"
-database_id = "PLACEHOLDER_RUN_wrangler_d1_create"
+database_id = "PLACEHOLDER_DEPLOY_SCRIPT_WILL_FILL"

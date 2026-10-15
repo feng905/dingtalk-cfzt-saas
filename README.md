@@ -1,6 +1,6 @@
 # dingtalk-cfzt-saas
 
-钉钉登录 Cloudflare Zero Trust 的多租户 SaaS — Worker 直接当 OIDC IdP，客户把 CF Access 的 OIDC 登录方式指到自己的 `https://<slug>.sso.<域名>` 即可。
+钉钉登录 Cloudflare Zero Trust 的多租户 SaaS — Worker 直接当 OIDC IdP，客户把 CF Access 的 OIDC 登录方式指到自己的 `https://<slug>.sso.eastasia-gcr-nfr.cftenant.com` 即可。
 
 架构与决策记录见 `~/Documents/notes/dingtalk-saas-roadmap.md`；协议层为什么这么写（钉钉三个非标坑）见同目录架构文档。
 
@@ -35,14 +35,16 @@ node -e "const c=require('crypto');const h=n=>c.randomBytes(n).toString('hex'); 
 npm run e2e     # 起 mock 钉钉 + wrangler dev，跑全部 27 项断言
 ```
 
-## 生产部署清单（首次）
+## 生产部署
 
-1. `SSO_BASE_DOMAIN` 改成真实域名，`wrangler.toml` 加通配符自定义域：
-   `routes = [{ pattern = "*.sso.<域名>", custom_domain = true }]`
-2. `wrangler d1 create dingtalk-saas` → 把 `database_id` 填进 `wrangler.toml`
-3. `wrangler d1 execute DB --remote --file=schema.sql`
-4. `wrangler secret put ENCRYPTION_KEY`（32 字节 hex）/ `STATE_SECRET` / `ADMIN_TOKEN`
-5. `wrangler deploy`，浏览器打开 `https://<管理域名>/admin/` 或用 API 建租户
+```bash
+bash deploy.sh --dry-run   # 预演：只读检查 + 展示计划
+bash deploy.sh             # 正式部署（全程交互确认）
+```
+
+服务占用 `*.sso.eastasia-gcr-nfr.cftenant.com` 子树，**不影响**同域其他主机名
+（含现有 `sso-dingtalk-proxy.eastasia-gcr-nfr.cftenant.com`，脚本部署前后会做回归比对）。
+完整步骤、手工等价命令、运维操作见 [docs/deploy.md](docs/deploy.md)。
 
 > 管理面当前只挡 ADMIN_TOKEN；上生产建议在 CF 侧再给 `/admin/*` 套一层 Access 自保护。
 
@@ -73,9 +75,9 @@ curl -s -H "$T" .../admin/tenants/acme/logs?limit=50                      # 登�
 流程概要：
 
 1. 客户在[钉钉开放平台](https://open.dingtalk.com)建企业内部应用，开通「个人信息读取」权限，
-   回调地址填 `https://<slug>.sso.<域名>/cb`
+   回调地址填 `https://<slug>.sso.eastasia-gcr-nfr.cftenant.com/cb`
 2. 把 AppKey/AppSecret + 自己的 CF 团队回调地址交给运营（或自助控制台）建租户
 3. 拿到 `client_id`/`client_secret`，在 CF ZT → Integrations → Identity providers → OpenID Connect 填五项：
-   Client ID / Client Secret / Auth URL=`https://<slug>.sso.<域名>/authorize` /
+   Client ID / Client Secret / Auth URL=`https://<slug>.sso.eastasia-gcr-nfr.cftenant.com/authorize` /
    Token URL=`.../token` / Certificate URL=`.../jwks`（PKCE 不开）
 4. 点 IdP 旁 Test 按钮真实扫码验证 → Access 应用勾选该登录方式

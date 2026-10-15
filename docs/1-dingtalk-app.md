@@ -33,10 +33,10 @@
 https://<你的租户子域>.sso.<服务域名>/cb
 ```
 
-例如租户子域是 `acme`、服务域名是 `sso.example.com`，就填：
+例如租户子域是 `acme`，就填：
 
 ```
-https://acme.sso.example.com/cb
+https://acme.sso.eastasia-gcr-nfr.cftenant.com/cb
 ```
 
 > 必须一字不差（https、路径 `/cb`）。填错的话扫码后钉钉会报「重定向地址错误」。

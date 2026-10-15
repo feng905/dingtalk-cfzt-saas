@@ -23,4 +23,4 @@
 
 - 钉钉企业的**管理员**账号（能进[钉钉开发者后台](https://open-dev.dingtalk.com)）
 - Cloudflare Zero Trust 团队域名（形如 `yourteam.cloudflareaccess.com`）
-- 你在服务方的租户子域（开通后形如 `acme.sso.<服务域名>`）
+- 你在服务方的租户子域（开通后形如 `acme.sso.eastasia-gcr-nfr.cftenant.com`）

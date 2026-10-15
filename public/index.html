@@ -213,7 +213,7 @@ footer .mono { font-family: var(--mono); font-size: 11.5px; letter-spacing: .06e
     <div class="hop m">
       <span class="n">STEP 2</span>
       <h3>跳转桥接服务</h3>
-      <p>Access 走标准 OIDC 协议，找到你的租户专属入口 <code>*.sso.服务域名</code>。</p>
+      <p>Access 走标准 OIDC 协议，找到你的租户专属入口 <code>*.sso.eastasia-gcr-nfr.cftenant.com</code>。</p>
     </div>
     <div class="hop b">
       <span class="n">STEP 3</span>
@@ -257,7 +257,7 @@ footer .mono { font-family: var(--mono); font-size: 11.5px; letter-spacing: .06e
       <h3>钉钉开放平台建应用</h3>
       <p>用企业管理员账号在<a href="https://open-dev.dingtalk.com" target="_blank" rel="noopener">钉钉开发者后台</a>建一个企业内部应用，开通「通讯录个人信息读权限」，回调白名单加上：</p>
       <ul>
-        <li><code>https://你的租户子域.sso.服务域名/cb</code></li>
+        <li><code>https://你的租户子域.sso.eastasia-gcr-nfr.cftenant.com/cb</code></li>
         <li>拿到 <strong>Client ID / Client Secret</strong> 交给服务方开通租户</li>
       </ul>
     </div>
@@ -271,9 +271,9 @@ footer .mono { font-family: var(--mono); font-size: 11.5px; letter-spacing: .06e
       <dl class="fields">
         <div class="field"><dt>Client ID</dt><dd>服务方颁发</dd></div>
         <div class="field"><dt>Client secret</dt><dd>服务方颁发</dd></div>
-        <div class="field"><dt>Auth URL</dt><dd>https://<span class="ph">slug</span>.sso.<span class="ph">域名</span>/authorize</dd></div>
-        <div class="field"><dt>Token URL</dt><dd>https://<span class="ph">slug</span>.sso.<span class="ph">域名</span>/token</dd></div>
-        <div class="field"><dt>Certificate URL</dt><dd>https://<span class="ph">slug</span>.sso.<span class="ph">域名</span>/jwks</dd></div>
+        <div class="field"><dt>Auth URL</dt><dd>https://<span class="ph">slug</span>.sso.eastasia-gcr-nfr.cftenant.com/authorize</dd></div>
+        <div class="field"><dt>Token URL</dt><dd>https://<span class="ph">slug</span>.sso.eastasia-gcr-nfr.cftenant.com/token</dd></div>
+        <div class="field"><dt>Certificate URL</dt><dd>https://<span class="ph">slug</span>.sso.eastasia-gcr-nfr.cftenant.com/jwks</dd></div>
       </dl>
       <p class="hint">保存后点 IdP 旁的 <em>Test</em> 按钮真实扫码验证，再把该登录方式挂到 Access 应用上。可选项保持默认：<em>PKCE 不要开</em>。</p>
     </div>
