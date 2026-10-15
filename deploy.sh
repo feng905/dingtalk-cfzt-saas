@@ -7,7 +7,8 @@
 #   bash deploy.sh --dry-run     只读预演：检查环境、展示计划，不做任何变更
 #   bash deploy.sh --yes         跳过全部确认（配合 CI；慎用）
 #   bash deploy.sh --domain=x.y  非交互指定部署主域（跳过域名输入）
-#   bash deploy.sh --add-domain=<主机名>   追加租户路由主机名并重新部署
+#   bash deploy.sh --code-only   只更新代码：配置自动从 D1 带出全部租户域名后重新部署
+#   bash deploy.sh --add-domain=<主机名>   追加额外路由主机名并重新部署
 #   bash deploy.sh --help        帮助
 #
 # 域名机制（仓库不含真实域名）:
@@ -47,16 +48,19 @@ DEPLOY_ENV=".deploy.env"
 # ---------- 参数 ----------
 DRY_RUN=0
 ASSUME_YES=0
+CODE_ONLY=0
 DOMAIN=""
 ADD_DOMAIN=""
+TENANT_SLUGS=""
 for ARG in "$@"; do
   case "$ARG" in
     --dry-run)        DRY_RUN=1 ;;
     --yes)            ASSUME_YES=1 ;;
+    --code-only)      CODE_ONLY=1 ;;
     --domain=*)       DOMAIN=$(printf '%s' "${ARG#--domain=}" | tr '[:upper:]' '[:lower:]' | tr -d ' ') ;;
     --add-domain=*)   ADD_DOMAIN=$(printf '%s' "${ARG#--add-domain=}" | tr '[:upper:]' '[:lower:]' | tr -d ' ') ;;
-    -h|--help)        sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) printf '未知参数: %s\n\n' "$ARG"; sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    -h|--help)        sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) printf '未知参数: %s\n\n' "$ARG"; sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
   esac
 done
 
@@ -127,23 +131,47 @@ http_code() {
   curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || printf '000'
 }
 
+# 查询远程 D1 里的全部租户 slug（库/表/配置不存在时输出空，绝不报错中断）
+# —— 租户主机名路由的事实源是数据库；wrangler 部署会删除「配置里没有」的已挂域名，
+#    所以每次生成都必须把 D1 里的租户全部带上，否则下次部署会把它们删掉
+db_slugs() {
+  local OUT
+  OUT=$(wrangler d1 execute DB --config "$DEPLOY_CFG" --remote --json -y --command "SELECT slug FROM tenants" 2>/dev/null || true)
+  printf '%s' "$OUT" | python3 -c '
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: d = []
+rows = []
+for item in (d if isinstance(d, list) else [d]):
+    rows += (item.get("results") or [])
+print(" ".join(r.get("slug", "") for r in rows if r.get("slug")))' 2>/dev/null || printf ''
+}
+
 # 生成 <root:wrangler.deploy.toml>（本地部署配置：真实域 + 路由 + database_id，gitignore）
+# 路由 = deploy-check 入口 + D1 全部租户主机名（CFG_SLUGS）+ .tenant-domains 额外主机名
 gen_deploy_config() { # gen_deploy_config <database_id>
   if [ "$DRY_RUN" = "1" ]; then
-    info "[dry-run] 将生成 ${DEPLOY_CFG}（deploy-check.${BASE_DOMAIN} + .tenant-domains 中的主机名，database_id ${1}）"
+    info "[dry-run] 将生成 ${DEPLOY_CFG}（deploy-check.${BASE_DOMAIN} + D1 租户域名 [${TENANT_SLUGS:-无}]，database_id ${1}）"
     return 0
   fi
-  CFG_BASE="$BASE_DOMAIN" CFG_ID="$1" python3 - <<'PYEOF'
+  CFG_BASE="$BASE_DOMAIN" CFG_ID="$1" CFG_SLUGS="$TENANT_SLUGS" python3 - <<'PYEOF'
 import os, re
 base = os.environ['CFG_BASE']
+slugs = os.environ.get('CFG_SLUGS', '').split()
 extra = []
 if os.path.exists('.tenant-domains'):
     with open('.tenant-domains', encoding='utf-8') as f:
         extra = [l.strip() for l in f if l.strip() and not l.strip().startswith('#')]
 check = 'deploy-check.' + base
 routes = ['{ pattern = "%s", custom_domain = true }' % check]
+for slug in slugs:
+    if not re.match(r'^[a-z0-9][a-z0-9-]{0,31}$', slug):
+        continue
+    h = slug + '.' + base
+    if h != check and all(('"%s"' % h) not in r for r in routes):
+        routes.append('{ pattern = "%s", custom_domain = true }' % h)
 for h in extra:
-    if h != check and all(h not in r for r in routes):
+    if h != check and all(('"%s"' % h) not in r for r in routes):
         routes.append('{ pattern = "%s", custom_domain = true }' % h)
 s = open('wrangler.toml', encoding='utf-8').read()
 s = s.replace('sso.example.com', base)
@@ -224,6 +252,7 @@ except Exception: lst = []
 print(next((d.get("uuid", "") for d in lst if d.get("name") == os.environ["DB_NAME"]), ""))
 ') || REMOTE_ID=""
   [ -n "$REMOTE_ID" ] || die "D1 $DB_NAME 不存在，请先完整运行一次 bash deploy.sh"
+  TENANT_SLUGS=$(db_slugs)
   gen_deploy_config "$REMOTE_ID"
   confirm "部署以启用 ${ADD_DOMAIN}？[Y/n] " || die "已取消"
   retry "部署" wrangler deploy --config "$DEPLOY_CFG"
@@ -244,6 +273,41 @@ print(next((d.get("uuid", "") for d in lst if d.get("name") == os.environ["DB_NA
   exit 0
 fi
 
+# ══════════ 子命令：--code-only（只更新代码；配置从 D1 重新生成，租户域名不失联） ══════════
+if [ "$CODE_ONLY" = "1" ] && [ "$DRY_RUN" != "1" ]; then
+  REMOTE_ID=$(wrangler d1 list --json 2>/dev/null | DB_NAME="$DB_NAME" python3 -c '
+import json, sys, os
+try: lst = json.load(sys.stdin)
+except Exception: lst = []
+print(next((d.get("uuid", "") for d in lst if d.get("name") == os.environ["DB_NAME"]), ""))
+') || REMOTE_ID=""
+  [ -n "$REMOTE_ID" ] || die "D1 $DB_NAME 不存在，请先完整运行一次 bash deploy.sh"
+  TENANT_SLUGS=$(db_slugs)
+  if [ -n "$TENANT_SLUGS" ]; then
+    info "将注册: deploy-check.${BASE_DOMAIN} + 租户域名 $(printf '%s' "$TENANT_SLUGS" | sed 's/ /、/g')"
+  else
+    info "将注册: deploy-check.${BASE_DOMAIN}（D1 里暂无租户）"
+  fi
+  gen_deploy_config "$REMOTE_ID"
+  confirm "部署新代码？[Y/n] " || die "已取消"
+  retry "部署" wrangler deploy --config "$DEPLOY_CFG"
+  CHECK_HOST="deploy-check.$BASE_DOMAIN"
+  C_CODE="000"
+  CI=0
+  while [ $CI -lt 12 ]; do
+    C_CODE=$(http_code "https://$CHECK_HOST/health")
+    [ "$C_CODE" = "200" ] && break
+    CI=$((CI + 1))
+    sleep 5
+  done
+  if [ "$C_CODE" = "200" ]; then
+    ok "新代码已上线（${CHECK_HOST}/health → 200）"
+  else
+    warn "健康检查未通过（${CHECK_HOST}/health → ${C_CODE}），请查 wrangler 输出"
+  fi
+  exit 0
+fi
+
 # ══════════════════════ 基线 + 计划 ══════════════════════
 info "基线检查同主域既有 Worker（部署后用于回归比对；没有也不影响部署）"
 OLD_HEALTH=$(http_code "https://$PROXY_HOST/health")
@@ -254,7 +318,13 @@ if [ "$OLD_AUTH" = "302" ];   then ok "老 Worker /auth → ${OLD_AUTH}（路线
 printf '\n'
 info "部署计划:"
 printf '  Worker:    %s\n' "$WORKER_NAME"
-printf '  注册主机名: deploy-check.%s + .tenant-domains 中的租户域\n' "$BASE_DOMAIN"
+PLAN_SLUGS=$(db_slugs)
+printf '  注册主机名: deploy-check.%s\n' "$BASE_DOMAIN"
+if [ -n "$PLAN_SLUGS" ]; then
+  for S in $PLAN_SLUGS; do printf '             %s.%s（租户域名，来自 D1）\n' "$S" "$BASE_DOMAIN"; done
+else
+  printf '             （D1 里暂无租户；之后的部署会自动带出租户域名）\n'
+fi
 printf '             （每租户一条精确 Custom Domain，CF 自动建 DNS 并签发证书）\n'
 printf '  数据库:    D1 %s\n' "$DB_NAME"
 printf '  本地配置:  %s（gitignore；仓库文件不含真实域名）\n' "$DEPLOY_CFG"
@@ -288,6 +358,12 @@ else
   else
     die "没有 D1 无法继续，已取消"
   fi
+fi
+TENANT_SLUGS=$(db_slugs)
+if [ -n "$TENANT_SLUGS" ]; then
+  ok "从 D1 带出租户域名: $(printf '%s' "$TENANT_SLUGS" | sed 's/ /、/g')"
+else
+  info "D1 里还没有租户（首次部署正常）；建租户后跑一次部署即可自动开通其域名"
 fi
 gen_deploy_config "$REMOTE_ID"
 

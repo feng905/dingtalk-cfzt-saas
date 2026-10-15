@@ -51,7 +51,9 @@ bash deploy.sh             # 正式部署（全程交互确认）
 **路由按租户逐条注册**：Custom Domains 不支持通配符，每个主机名
 （`deploy-check.sso.<主域>` 管理入口 + 各租户 `<slug>.sso.<主域>`）单独注册为
 Custom Domain，Cloudflare 自动建 DNS 并签发证书（两级子域也免费覆盖）。
-加租户：`bash deploy.sh --add-domain=<slug>.sso.<主域>`。
+**部署脚本自动从 D1 带出全部租户域名**——建完租户跑一次
+`bash deploy.sh --code-only` 即可开通；改代码更新也用同一条命令
+（不要直接 `wrangler deploy`：本地生成的配置可能是旧的，会删掉新租户的域名）。
 完整步骤、手工等价命令、运维操作见 [docs/deploy.md](docs/deploy.md)。
 
 > 管理面当前只挡 ADMIN_TOKEN；上生产建议在 CF 侧再给 `/admin/*` 套一层 Access 自保护。

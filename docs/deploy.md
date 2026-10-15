@@ -129,14 +129,21 @@ curl -X POST https://deploy-check.sso.example.com/admin/tenants \
 
 ### 开通租户主机名路由
 
-租户创建后，其入口 `<slug>.sso.<主域>` 还需注册为 Custom Domain 才能解析（自动建 DNS + 签发证书）：
+租户创建后（管理控制台或 API 均可），其入口 `<slug>.sso.<主域>` 还需注册为
+Custom Domain 才能解析（自动建 DNS + 签发证书）。**脚本会自动从 D1 带出全部租户域名**：
 
 ```bash
-bash deploy.sh --add-domain=acme.sso.example.com
+bash deploy.sh --code-only   # 只更新代码/路由：从 D1 读出所有租户，逐条注册后部署
 ```
 
-脚本会校验主机名在 `sso.<主域>` 子树内、追加到本地 `.tenant-domains`（gitignore）、
-重新部署并轮询 `/health` 直到证书就绪。deploy.sh 创建租户时也会询问是否当场做这一步。
+部署计划里会列出将注册的每个租户主机名，部署后轮询证书就绪。也可以在管理控制台
+（`https://deploy-check.sso.<主域>/admin/`）的「检测域名」按钮确认生效。
+
+`--add-domain=<主机名>` 仅用于注册**不在 D1 里的额外主机名**（追加到本地 `.tenant-domains`）。
+
+> ⚠️ **不要用 `npx wrangler deploy --config …` 直接更新代码**：本地生成的配置可能是旧的，
+> 而 wrangler 部署会**删除配置里没有的**租户域名（changeset replace 语义）。
+> `--code-only` 每次从 D1 重新生成配置，永远是最新全集。
 
 ## 日常运维
 
@@ -145,7 +152,7 @@ bash deploy.sh --add-domain=acme.sso.example.com
 | 操作 | 命令 |
 |---|---|
 | 重复部署（改代码后） | `bash deploy.sh` —— D1/Secrets 阶段会检测已存在并默认跳过；主域直接回车复用 |
-| 只更新代码 | `npx wrangler deploy --config wrangler.deploy.toml` |
+| 只更新代码/开通新租户域名 | `bash deploy.sh --code-only`（配置从 D1 重新生成，自动带上全部租户域名） |
 | 轮换某租户签名密钥 | `POST /admin/tenants/<slug>/rotate-key`（旧密钥进入 retiring，JWKS 双活） |
 | 轮换管理令牌 | `openssl rand -hex 24` → `wrangler secret put ADMIN_TOKEN --config wrangler.deploy.toml` → 更新本地备份 |
 | 停用租户 | `PATCH /admin/tenants/<slug>` `{"status":"disabled"}` |
