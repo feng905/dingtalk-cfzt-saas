@@ -226,16 +226,19 @@ async function tenantLogs(request, env, slug) {
 /* ---------------- 路由 ---------------- */
 
 export async function handleAdmin(request, env) {
-  if (!checkAuth(request, env)) return err("unauthorized", 401);
-
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, "") || "/admin";
   const m = path.match(/^\/admin\/tenants\/([a-z0-9-]+)(\/.*)?$/);
 
   try {
-    if (path === "/admin" || path === "/admin/") {
+    // HTML 控制台外壳无需令牌即可打开（令牌在页面里输入、只存浏览器本地）；
+    // 下方所有数据 API 仍要求 Bearer ADMIN_TOKEN
+    if (path === "/admin") {
       return new Response(adminHtml(), { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
+
+    if (!checkAuth(request, env)) return err("unauthorized", 401);
+
     if (path === "/admin/tenants" && request.method === "POST") return await createTenant(request, env);
     if (path === "/admin/tenants" && request.method === "GET") return await listTenants(env);
     if (m) {
