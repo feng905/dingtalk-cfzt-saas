@@ -1,0 +1,322 @@
+<title>钉钉登录 Cloudflare Zero Trust</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+
+<style>
+/*
+  设计方案
+  色：纸面冷灰底 + 双功能色——钉钉蓝（身份源侧）/ Cloudflare 橙（Access 侧），墨色文字
+  字：Noto Serif SC（标题，衬线给"简报"气质）/ Noto Sans SC（正文）/ JetBrains Mono（URL、字段名）
+  版：72ch 窄栏编辑排版，登录链路是一条真实的横向时序（移动端纵排），五字段配置用键值对而非表格
+*/
+:root {
+  --bg: #F6F8FA;
+  --fg: #1C2530;
+  --muted: #5F6E7E;
+  --line: #DCE3EA;
+  --card: #FFFFFF;
+  --dt: #0B5FD9;        /* 钉钉蓝：身份源侧 */
+  --dt-soft: #E7F0FE;
+  --cf: #B54E0E;        /* Cloudflare 橙（加深保证对比度） */
+  --cf-soft: #FDEEDF;
+  --code-bg: #EEF2F6;
+  --serif: "Noto Serif SC", "Songti SC", serif;
+  --sans: "Noto Sans SC", "PingFang SC", sans-serif;
+  --mono: "JetBrains Mono", "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131A22; --fg: #E8EDF2; --muted: #94A4B5; --line: #2A3542;
+    --card: #1A2330; --dt: #71A8FF; --dt-soft: #17273F;
+    --cf: #FFA05C; --cf-soft: #33230F; --code-bg: #202B38;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131A22; --fg: #E8EDF2; --muted: #94A4B5; --line: #2A3542;
+  --card: #1A2330; --dt: #71A8FF; --dt-soft: #17273F;
+  --cf: #FFA05C; --cf-soft: #33230F; --code-bg: #202B38;
+  color-scheme: dark;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 15.5px;
+  line-height: 1.75;
+  margin: 0;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+}
+
+.wrap { max-width: 760px; margin: 0 auto; padding-block: clamp(40px, 8vw, 88px) 56px; }
+
+/* ---------- 头部 ---------- */
+.topline {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--mono); font-size: 11.5px; letter-spacing: .08em; color: var(--muted);
+}
+.topline .node { padding: 2px 9px; border-radius: 99px; border: 1px solid var(--line); background: var(--card); }
+.topline .node.b { color: var(--dt); border-color: color-mix(in srgb, var(--dt) 35%, var(--line)); }
+.topline .node.o { color: var(--cf); border-color: color-mix(in srgb, var(--cf) 35%, var(--line)); }
+.free-tag {
+  margin-left: auto; font-family: var(--sans); font-size: 12px; font-weight: 500;
+  color: var(--dt); background: var(--dt-soft); border-radius: 99px; padding: 3px 11px;
+}
+h1 {
+  font-family: var(--serif); font-weight: 900;
+  font-size: clamp(30px, 6.4vw, 46px); line-height: 1.32;
+  letter-spacing: .01em; margin: 26px 0 18px; text-wrap: balance;
+}
+h1 .b { color: var(--dt); } h1 .o { color: var(--cf); }
+.lede { font-size: 17px; color: var(--muted); max-width: 34em; margin: 0 0 8px; }
+.lede strong { color: var(--fg); font-weight: 600; }
+
+/* ---------- 小节 ---------- */
+section { margin-top: clamp(44px, 8vw, 72px); }
+.eyebrow {
+  font-family: var(--mono); font-size: 12px; letter-spacing: .14em;
+  color: var(--muted); margin: 0 0 6px;
+}
+.eyebrow::before { content: "§ "; color: var(--line); }
+h2 { font-family: var(--serif); font-weight: 700; font-size: clamp(21px, 4vw, 26px); margin: 0 0 14px; text-wrap: balance; }
+p { margin: 0 0 12px; }
+code {
+  font-family: var(--mono); font-size: .86em; background: var(--code-bg);
+  border-radius: 5px; padding: .1em .38em; word-break: break-all;
+}
+
+/* ---------- 登录链路（真实时序，编号承载顺序信息） ---------- */
+.chain { display: grid; gap: 10px; margin-top: 20px; }
+@media (min-width: 640px) { .chain { grid-template-columns: repeat(4, 1fr); gap: 12px; } }
+.hop {
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 14px 16px 12px; position: relative; min-width: 0;
+}
+.hop .n {
+  font-family: var(--mono); font-size: 11px; letter-spacing: .1em; color: var(--muted);
+  display: block; margin-bottom: 6px;
+}
+.hop h3 { font-size: 14.5px; font-weight: 700; margin: 0 0 4px; }
+.hop p { font-size: 12.5px; color: var(--muted); line-height: 1.6; margin: 0; }
+.hop.b { border-top: 3px solid var(--dt); } .hop.b .n { color: var(--dt); }
+.hop.o { border-top: 3px solid var(--cf); } .hop.o .n { color: var(--cf); }
+.hop.m { border-top: 3px solid var(--muted); }
+.hop::after {
+  content: "→"; position: absolute; right: -14px; top: 50%; transform: translateY(-50%);
+  color: var(--muted); font-size: 15px; z-index: 1;
+}
+@media (max-width: 639px) { .hop::after { content: "↓"; right: 18px; top: auto; bottom: -17px; } }
+.hop:last-child::after { content: none; }
+
+/* ---------- 三个坑 ---------- */
+.pitfalls { display: grid; gap: 10px; margin-top: 18px; }
+@media (min-width: 640px) { .pitfalls { grid-template-columns: repeat(3, 1fr); gap: 12px; } }
+.pit { border-left: 3px solid var(--dt); padding: 2px 0 2px 14px; min-width: 0; }
+.pit h3 { font-size: 14px; margin: 0 0 4px; font-family: var(--mono); font-weight: 600; }
+.pit p { font-size: 13px; color: var(--muted); margin: 0; line-height: 1.65; }
+
+/* ---------- 接入步骤 ---------- */
+.steps { counter-reset: step; display: grid; gap: 14px; margin-top: 20px; }
+.step { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px 20px; min-width: 0; }
+.step > h3 { display: flex; align-items: baseline; gap: 12px; font-size: 16px; font-weight: 700; margin: 0 0 8px; }
+.step > h3::before {
+  counter-increment: step; content: counter(step);
+  font-family: var(--mono); font-size: 13px; color: var(--card);
+  background: var(--fg); border-radius: 7px; padding: 1px 8px; flex: none;
+}
+.step p, .step li { font-size: 14px; color: var(--muted); }
+.step strong { color: var(--fg); font-weight: 600; }
+.step ul { margin: 6px 0 0; padding-left: 1.2em; }
+.step li { margin-bottom: 4px; }
+
+/* 五字段配置：键值对列表 */
+.fields {
+  margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+}
+.field {
+  display: grid; grid-template-columns: 9.5em 1fr; gap: 4px 14px;
+  padding: 9px 14px; font-size: 13px; align-items: baseline;
+}
+.field + .field { border-top: 1px solid var(--line); }
+.field dt { color: var(--muted); font-size: 12.5px; }
+.field dd { margin: 0; font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+.field dd .ph { color: var(--cf); }
+@media (max-width: 560px) { .field { grid-template-columns: 1fr; gap: 1px; } }
+.hint { font-size: 12.5px; color: var(--muted); margin-top: 10px; }
+.hint em { font-style: normal; color: var(--cf); font-weight: 600; }
+
+/* ---------- 安全清单 ---------- */
+.spec { display: grid; gap: 0; margin-top: 18px; border-top: 1px solid var(--line); }
+.spec li {
+  list-style: none; display: grid; grid-template-columns: 11em 1fr; gap: 4px 16px;
+  padding: 11px 2px; border-bottom: 1px solid var(--line); font-size: 14px; align-items: baseline;
+}
+.spec ul { margin: 0; padding: 0; }
+.spec .k { font-weight: 600; }
+.spec .v { color: var(--muted); font-size: 13.5px; min-width: 0; }
+@media (max-width: 560px) { .spec li { grid-template-columns: 1fr; gap: 2px; } }
+
+/* ---------- FAQ ---------- */
+details {
+  border-bottom: 1px solid var(--line); padding: 4px 0;
+}
+details summary {
+  cursor: pointer; font-weight: 600; font-size: 15px; padding: 12px 0;
+  list-style: none; position: relative; padding-right: 28px;
+}
+details summary::-webkit-details-marker { display: none; }
+details summary::after {
+  content: "+"; position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  font-family: var(--mono); color: var(--muted); font-size: 17px;
+}
+details[open] summary::after { content: "−"; }
+details .a { color: var(--muted); font-size: 14px; padding: 0 0 14px; }
+details .a code { font-size: .85em; }
+
+/* ---------- 尾部 ---------- */
+footer {
+  margin-top: clamp(48px, 8vw, 80px); padding-top: 20px; border-top: 1px solid var(--line);
+  font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 18px;
+  justify-content: space-between;
+}
+footer .mono { font-family: var(--mono); font-size: 11.5px; letter-spacing: .06em; }
+
+:focus-visible { outline: 2px solid var(--dt); outline-offset: 2px; border-radius: 4px; }
+@media (prefers-reduced-motion: no-preference) {
+  .hop, .step { transition: border-color .15s ease; }
+}
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="topline">
+    <span class="node b">钉钉</span>
+    <span aria-hidden="true">⟷</span>
+    <span class="node o">Cloudflare Zero Trust</span>
+    <span class="free-tag">免费开放</span>
+  </div>
+  <h1>钉钉扫码，登录 <span class="o">Cloudflare Zero Trust</span> 背后的<span class="b">所有应用</span></h1>
+  <p class="lede">面向国内团队的 SSO 桥接服务：把钉钉变成 Cloudflare Access 的身份源。员工用熟悉的钉钉 App 扫码进门，<strong>受保护的应用一行代码不用改</strong>。</p>
+</header>
+
+<section>
+  <p class="eyebrow">登录链路</p>
+  <h2>一次扫码，四步完成</h2>
+  <div class="chain">
+    <div class="hop o">
+      <span class="n">STEP 1</span>
+      <h3>访问受保护应用</h3>
+      <p>Cloudflare Access 拦下未登录访客，转到登录页，员工选择「钉钉」。</p>
+    </div>
+    <div class="hop m">
+      <span class="n">STEP 2</span>
+      <h3>跳转桥接服务</h3>
+      <p>Access 走标准 OIDC 协议，找到你的租户专属入口 <code>*.sso.服务域名</code>。</p>
+    </div>
+    <div class="hop b">
+      <span class="n">STEP 3</span>
+      <h3>钉钉扫码授权</h3>
+      <p>服务把标准协议翻译成钉钉的私有协议，员工在钉钉 App 上点确认。</p>
+    </div>
+    <div class="hop o">
+      <span class="n">STEP 4</span>
+      <h3>签发身份进门</h3>
+      <p>服务签回 RS256 签名的身份令牌，Access 验签放行，种下登录会话。</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">为什么需要</p>
+  <h2>钉钉不是标准 OIDC，直连必挂</h2>
+  <p>Cloudflare Access 原生支持 Google、GitHub、Okta……唯独没有钉钉。因为钉钉的「OAuth2」有三处和规范对不上，标准 OIDC 客户端根本走不通：</p>
+  <div class="pitfalls">
+    <div class="pit">
+      <h3>token 端点</h3>
+      <p>只收 <code>JSON camelCase</code> 请求体，而所有标准实现发的都是表单或 Basic 头。</p>
+    </div>
+    <div class="pit">
+      <h3>用户信息端点</h3>
+      <p>要求专用的 <code>x-acs-dingtalk-access-token</code> 头，不认标准的 <code>Bearer</code>。</p>
+    </div>
+    <div class="pit">
+      <h3>回调参数</h3>
+      <p>授权码塞在 <code>authCode</code> 参数里，不是规范里的 <code>code</code>，标准端直接找不到。</p>
+    </div>
+  </div>
+  <p style="margin-top:16px">桥接服务在中间做完整翻译：对钉钉说钉钉的话，对 Cloudflare 说标准 OIDC。这套翻译已经过真实企业环境全链路验证。</p>
+</section>
+
+<section>
+  <p class="eyebrow">接入方式</p>
+  <h2>三步上线，全程不改应用</h2>
+  <div class="steps">
+    <div class="step">
+      <h3>钉钉开放平台建应用</h3>
+      <p>用企业管理员账号在<a href="https://open-dev.dingtalk.com" target="_blank" rel="noopener">钉钉开发者后台</a>建一个企业内部应用，开通「通讯录个人信息读权限」，回调白名单加上：</p>
+      <ul>
+        <li><code>https://你的租户子域.sso.服务域名/cb</code></li>
+        <li>拿到 <strong>Client ID / Client Secret</strong> 交给服务方开通租户</li>
+      </ul>
+    </div>
+    <div class="step">
+      <h3>服务方开通租户</h3>
+      <p>登记钉钉凭证和你的 Cloudflare 团队域名后，你会得到一对 OIDC 凭证，以及一组专属端点。你的组织信息（corpId）会配置进登录白名单——只有你企业成员能通过。</p>
+    </div>
+    <div class="step">
+      <h3>Cloudflare 填五个字段</h3>
+      <p>Zero Trust 控制台 → <strong>Integrations → Identity providers → OpenID Connect</strong>：</p>
+      <dl class="fields">
+        <div class="field"><dt>Client ID</dt><dd>服务方颁发</dd></div>
+        <div class="field"><dt>Client secret</dt><dd>服务方颁发</dd></div>
+        <div class="field"><dt>Auth URL</dt><dd>https://<span class="ph">slug</span>.sso.<span class="ph">域名</span>/authorize</dd></div>
+        <div class="field"><dt>Token URL</dt><dd>https://<span class="ph">slug</span>.sso.<span class="ph">域名</span>/token</dd></div>
+        <div class="field"><dt>Certificate URL</dt><dd>https://<span class="ph">slug</span>.sso.<span class="ph">域名</span>/jwks</dd></div>
+      </dl>
+      <p class="hint">保存后点 IdP 旁的 <em>Test</em> 按钮真实扫码验证，再把该登录方式挂到 Access 应用上。可选项保持默认：<em>PKCE 不要开</em>。</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">安全设计</p>
+  <h2>按对外服务标准做的底层</h2>
+  <ul class="spec">
+    <li><span class="k">租户隔离</span><span class="v">每个组织独立子域名、独立签名密钥对，互不可见。</span></li>
+    <li><span class="k">组织准入</span><span class="v">钉钉返回的 corpId 与白名单比对，外部钉钉账号扫码无效。</span></li>
+    <li><span class="k">凭证保管</span><span class="v">钉钉密钥 AES-GCM 加密落库；OIDC 密钥只存哈希，明文仅开通时展示一次。</span></li>
+    <li><span class="k">防重放</span><span class="v">授权码一次性且 2 分钟有效，重复提交直接拒绝。</span></li>
+    <li><span class="k">密钥轮换</span><span class="v">签名密钥支持在线轮换，新旧双活，登录不断线。</span></li>
+    <li><span class="k">隐私最小化</span><span class="v">只透传登录所需的 unionId 与昵称，不落库手机号、头像等个人信息。</span></li>
+  </ul>
+</section>
+
+<section>
+  <p class="eyebrow">常见问题</p>
+  <h2>接入前常问的</h2>
+  <details>
+    <summary>员工登录时用什么账号？</summary>
+    <div class="a">就用钉钉：员工的钉钉 App 扫码或点确认即完成登录，没有新密码、不用记别的。身份邮箱按 <code>unionId@dingtalk.local</code> 生成，可直接用在 Access 策略白名单里。</div>
+  </details>
+  <details>
+    <summary>会影响现有登录方式吗？</summary>
+    <div class="a">不会。钉钉登录作为一个新登录方式挂到 Access 应用上，原有的一次性邮箱 PIN、其他 IdP 全部保留，登录页多个按钮而已，随时可切换。</div>
+  </details>
+  <details>
+    <summary>Test 按钮报错怎么办？</summary>
+    <div class="a">九成是五个字段里有 URL 填错，逐字核对三个端点的结尾（<code>/authorize</code>、<code>/token</code>、<code>/jwks</code>，无尾斜杠）。完整的报错对照表在接入文档里。</div>
+  </details>
+  <details>
+    <summary>服务的可用性怎么保障？</summary>
+    <div class="a">服务跑在 Cloudflare 全球边缘网络上，与你的 Zero Trust 同源同网；登录链路有健康拨测与告警，签名密钥可在线轮换，单租户问题不影响其他组织。</div>
+  </details>
+</section>
+
+<footer>
+  <span>当前免费开放 · 按 BYO 模式接入</span>
+  <span class="mono">DINGTALK × CLOUDFLARE ZERO TRUST</span>
+</footer>
+
+</div>
