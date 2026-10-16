@@ -1,23 +1,23 @@
 # dingtalk-cfzt-saas
 
-钉钉登录 Cloudflare Zero Trust 的多租户 SaaS — Worker 直接当 OIDC IdP，客户把 CF Access 的 OIDC 登录方式指到自己的 `https://<slug>.sso.<服务域名>` 即可。
-
-架构与决策记录见 `~/Documents/notes/dingtalk-saas-roadmap.md`；协议层为什么这么写（钉钉三个非标坑）见同目录架构文档。
+钉钉登录 Cloudflare Zero Trust 的多租户 SaaS — Worker 直接当 OIDC IdP，客户把 CF Access 的 OIDC 登录方式指到自己的 `https://<slug>.sso.<服务域名>` 即可。免费开放，无品牌、无埋点。
 
 ## 结构
 
 ```
 src/
-  index.js     路由入口（/health /admin/* 租户 OIDC 面）
+  index.js     路由入口（/health /admin/* /docs/* 租户 OIDC 面）
   core.js      WebCrypto 原语：HMAC state/code、AES-GCM 字段加密、RSA 密钥、RS256 JWT
   dingtalk.js  钉钉私有协议客户端（JSON camelCase / x-acs 头 / corpId）
   tenant.js    Host→租户解析、D1 配置访问、密钥缓存、CF 回调形态校验
   oidc.js      discovery /authorize /cb /token /userinfo /jwks
-  admin.js     管理 API + 最简 HTML 控制台（/admin/）
+  admin.js     管理 API + 内联 HTML 控制台（/admin/）
+  docs.js      客户接入文档 /docs（markdown 打进 Worker 包，按租户填真实值）
+  cfapi.js     Worker 自服务开通租户域名（CF Custom Domains API）
 schema.sql     D1 表（tenants / oidc_clients / signing_keys / used_jti / audit_log）
 test/
   mock-dingtalk.js  钉钉协议模拟器（两个 mock 应用，用于 corpId 拒绝测试）
-  e2e.sh            27 项断言的本地全链路测试
+  e2e.sh            49 项断言的本地全链路测试
 ```
 
 安全设计：租户凭证 AES-GCM 落库（KEK=ENCRYPTION_KEY）、每租户独立 RSA 密钥对、OIDC client secret 只存哈希、
@@ -32,7 +32,7 @@ node -e "const c=require('crypto');const h=n=>c.randomBytes(n).toString('hex'); 
   ['ENCRYPTION_KEY='+h(32),'STATE_SECRET='+h(32),'ADMIN_TOKEN='+h(24),          \
    'DT_API_BASE=http://127.0.0.1:9901','DT_LOGIN_BASE=http://127.0.0.1:9901',   \
    'SSO_BASE_DOMAIN=sso.example.com','DEV_TENANT=demo',''].join('\n'))"
-npm run e2e     # 起 mock 钉钉 + wrangler dev，跑全部 27 项断言
+npm run e2e     # 起 mock 钉钉 + wrangler dev，跑全部 49 项断言
 ```
 
 ## 生产部署
@@ -64,8 +64,8 @@ Custom Domain，Cloudflare 自动建 DNS 并签发证书（两级子域也免费
 
 ```bash
 T="Authorization: Bearer $ADMIN_TOKEN"
-# 建租户（client_secret 已加密保存，随时可再查；同时自动开通租户域名——若已配置自动开通）
-curl -X POST https://admin host/admin/tenants -H "$T" -H "Content-Type: application/json" -d '{
+# 管理入口约定在 deploy-check.sso.<服务域名>（建租户同时自动开通租户域名——若已配置自动开通）
+curl -X POST https://deploy-check.sso.example.com/admin/tenants -H "$T" -H "Content-Type: application/json" -d '{
   "slug": "acme",
   "corpIds": ["dingxxxxxxxxxxxxxxxx"],          # 客户钉钉组织的 corpId，["*"]=不限
   "dtClientId": "<客户钉钉应用 AppKey>",
@@ -97,3 +97,7 @@ curl -s -H "$T" .../admin/tenants/acme/logs?limit=50                      # 登�
    Client ID / Client Secret / Auth URL=`https://<slug>.sso.<服务域名>/authorize` /
    Token URL=`.../token` / Certificate URL=`.../jwks`（PKCE 不开）
 4. 点 IdP 旁 Test 按钮真实扫码验证 → Access 应用勾选该登录方式
+
+## 协议
+
+[MIT](LICENSE)
