@@ -54,6 +54,7 @@ CONSOLE_HTML=$(curl -s $ADMIN/admin/)
 printf '%s' "$CONSOLE_HTML" | grep -q '<meta charset="utf-8">' && ok "控制台声明 charset" || bad "控制台缺 charset 声明"
 printf '%s' "$CONSOLE_HTML" | grep -q 'Certificate URL' && ok "控制台含 CF Access 五字段提示" || bad "控制台缺五字段提示"
 printf '%s' "$CONSOLE_HTML" | grep -q 'deploy.sh --code-only' && ok "控制台含域名开通指引" || bad "控制台缺域名开通指引"
+printf '%s' "$CONSOLE_HTML" | grep -q 'acts.appendChild(out)' && ok "域名卡状态条已挂载 DOM（检测按钮回归修复）" || bad "域名卡状态条游离于 DOM（检测按钮会没反应）"
 curl -s http://127.0.0.1:8787/ | grep -q '<meta charset="utf-8">' && ok "落地页声明 charset" || bad "落地页缺 charset 声明"
 
 CREATE=$(curl -s -X POST $ADMIN/admin/tenants -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" -d '{

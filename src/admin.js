@@ -512,13 +512,20 @@ function card(title, cls){
 function notice(text, kind){
   return el("div", "group" + (kind ? " " + kind : ""), text);
 }
-/* 探测域名是否已开通：no-cors fetch，DNS 失败会 reject */
+/* 探测域名是否已开通：no-cors fetch，DNS 失败会 reject；12s 超时兜底 */
 function probe(host, out){
   out.style.color = "var(--muted)"; out.textContent = "检测中…";
-  fetch("https://" + host + "/health", { mode: "no-cors", cache: "no-store" })
+  var ctl = ("AbortController" in window) ? new AbortController() : null;
+  var timer = ctl && setTimeout(function(){ ctl.abort(); }, 12000);
+  fetch("https://" + host + "/health", { mode: "no-cors", cache: "no-store", signal: ctl && ctl.signal })
     .then(function(){ out.style.color = "var(--ok)"; out.textContent = "✔ 已开通并可访问"; })
-    .catch(function(){ out.style.color = "var(--danger)";
-      out.textContent = "✘ 还没开通 —— 点「开通域名」注册后再试"; });
+    .catch(function(e){
+      out.style.color = "var(--danger)";
+      out.textContent = (e && e.name === "AbortError")
+        ? "⏱ 检测超时 —— 域名可能刚注册还没生效（DNS/证书最长要几分钟），稍后再试"
+        : "✘ 还没开通 —— 点「开通域名」注册后再试";
+    })
+    .then(function(){ if (timer) clearTimeout(timer); });
 }
 /* 开通域名：调 Worker 自服务 API；返回 promise 便于串检测 */
 function provisionBtn(host, slug, out){
@@ -544,10 +551,11 @@ function probeBtn(host, out){
 function domainCard(slug){
   var host = slug + "." + BASE;
   var c = card("租户域名 · https://" + host, "dt");
-  var out = el("span"); out.style.fontSize = ".85rem"; out.style.marginLeft = ".5rem";
+  var out = el("span"); out.style.fontSize = ".85rem"; out.style.alignSelf = "center";
   var acts = el("div", "acts");
   acts.appendChild(provisionBtn(host, slug, out));
   acts.appendChild(probeBtn(host, out));
+  acts.appendChild(out); /* 状态条必须挂进 DOM——之前漏了这行，按钮写状态到游离元素上，点了没反应 */
   c.appendChild(acts);
   c.appendChild(el("p", "hint", "域名注册 = 挂 Custom Domain，DNS 与证书自动签发；正常 1-2 分钟生效。若自动开通未配置，也可在服务器跑 bash deploy.sh --code-only 注册现有租户域名。"));
   return { card: c, out: out };
