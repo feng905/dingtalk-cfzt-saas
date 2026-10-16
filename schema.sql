@@ -19,7 +19,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_tenants_dt_client_id ON tenants(dt_client_
 CREATE TABLE IF NOT EXISTS oidc_clients (
   client_id   TEXT PRIMARY KEY,
   tenant_slug TEXT NOT NULL,
-  secret_hash TEXT NOT NULL,                   -- SHA-256 hex，明文只显示一次
+  secret_hash TEXT NOT NULL,                   -- SHA-256 hex
+  secret_enc  TEXT,                            -- AES-GCM 密文（控制台可再次查看；旧库由 Worker 惰性 ALTER 补列）
   status      TEXT NOT NULL DEFAULT 'active',
   created_at  INTEGER NOT NULL
 );

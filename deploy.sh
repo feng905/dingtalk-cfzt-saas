@@ -154,9 +154,10 @@ gen_deploy_config() { # gen_deploy_config <database_id>
     info "[dry-run] 将生成 ${DEPLOY_CFG}（deploy-check.${BASE_DOMAIN} + D1 租户域名 [${TENANT_SLUGS:-无}]，database_id ${1}）"
     return 0
   fi
-  CFG_BASE="$BASE_DOMAIN" CFG_ID="$1" CFG_SLUGS="$TENANT_SLUGS" python3 - <<'PYEOF'
+  CFG_BASE="$BASE_DOMAIN" CFG_ID="$1" CFG_SLUGS="$TENANT_SLUGS" CFG_ACCT="$TOKEN_ACCT" python3 - <<'PYEOF'
 import os, re
 base = os.environ['CFG_BASE']
+acct = os.environ.get('CFG_ACCT', '')
 slugs = os.environ.get('CFG_SLUGS', '').split()
 extra = []
 if os.path.exists('.tenant-domains'):
@@ -179,6 +180,9 @@ s = re.sub(r'(?m)^# ROUTES_PLACEHOLDER.*$',
            'routes = [\n  ' + ',\n  '.join(routes) + '\n]', s, count=1)
 s = re.sub(r'(database_id\s*=\s*)"[^"]*"',
            lambda m: m.group(1) + '"' + os.environ['CFG_ID'] + '"', s, count=1)
+if acct and not acct.startswith('PLACEHOLDER'):
+    s = re.sub(r'(CF_ACCOUNT_ID\s*=\s*)"[^"]*"',
+               lambda m: m.group(1) + '"' + acct + '"', s, count=1)
 open('wrangler.deploy.toml', 'w', encoding='utf-8').write(s)
 PYEOF
   chmod 600 "$DEPLOY_CFG" 2>/dev/null || true
@@ -200,6 +204,8 @@ if ! grep -q "logged in" "$WHOAMI_TMP"; then
   die "wrangler 未登录（或连不上 api.cloudflare.com）。请先: npx wrangler login；已登录则稍后重跑"
 fi
 sed -n '1,10p' "$WHOAMI_TMP"
+ACCOUNT_ID=$(grep -Eo '[0-9a-f]{32}' "$WHOAMI_TMP" | head -1)
+[ -n "$ACCOUNT_ID" ] && info "CF Account ID: $ACCOUNT_ID"
 rm -f "$WHOAMI_TMP"
 [ -f public/index.html ] || die "缺少 public/index.html（落地页）"
 [ -f schema.sql ]        || die "缺少 schema.sql"
@@ -231,6 +237,13 @@ if [ "$DOMAIN" != "$ENV_DOMAIN" ] && [ "$DRY_RUN" != "1" ]; then
   printf 'DEPLOY_DOMAIN=%s\n' "$DOMAIN" > "$DEPLOY_ENV"
   ok "已记住到本地 ${DEPLOY_ENV}（gitignore，下次运行直接回车）"
 fi
+# CF_ACCOUNT_ID：Worker 调 CF API 开通域名所需（.deploy.env 优先，其次预检提取）
+ENV_ACCT_ID=""
+if [ -f "$DEPLOY_ENV" ]; then
+  ENV_ACCT_ID=$(sed -n 's/^CF_ACCOUNT_ID=//p' "$DEPLOY_ENV" | head -1 | tr -d ' \r')
+fi
+TOKEN_ACCT="$ENV_ACCT_ID"
+case "$TOKEN_ACCT" in '' | PLACEHOLDER*) TOKEN_ACCT="$ACCOUNT_ID" ;; esac
 
 # ══════════ 子命令：--add-domain（追加租户主机名路由并重新部署） ══════════
 if [ -n "$ADD_DOMAIN" ]; then
@@ -452,6 +465,89 @@ for NAME in ENCRYPTION_KEY STATE_SECRET ADMIN_TOKEN; do
     gen_and_put "$NAME"
   fi
 done
+
+# ══════════════════ 3.5/5 域名自动开通（可选，推荐） ══════════════════
+# 配好后 Worker 建租户时自己调 CF API 挂 Custom Domain，无需再跑部署脚本；
+# 不配置则回退为「建租户后跑 bash deploy.sh --code-only」。
+stage "3.5/5 域名自动开通（可选，推荐）"
+if [ "$DRY_RUN" = "1" ]; then
+  info "[dry-run] 跳过: 配置 CF_API_TOKEN（Worker 建租户时自动注册域名）"
+elif [ "$(has_secret CF_API_TOKEN)" = "yes" ] && [ -n "$TOKEN_ACCT" ] && ! printf '%s' "$TOKEN_ACCT" | grep -q '^PLACEHOLDER'; then
+  ok "CF_API_TOKEN 已配置，Worker 可自动开通租户域名（控制台「开通域名」按钮同源）"
+elif [ -z "$TOKEN_ACCT" ] || printf '%s' "$TOKEN_ACCT" | grep -q '^PLACEHOLDER'; then
+  warn "无法确定 CF Account ID（whoami 未返回且 ${DEPLOY_ENV} 无 CF_ACCOUNT_ID），跳过"
+  info "可手动在 ${DEPLOY_ENV} 写入 CF_ACCOUNT_ID=<32 位十六进制> 后重跑"
+elif confirm "配置 Worker 自动开通租户域名？（推荐；需创建一个最小权限 API Token）[Y/n] "; then
+  printf '\n'
+  info "① 浏览器打开 https://dash.cloudflare.com/profile/api-tokens → 创建令牌 → 创建自定义令牌"
+  printf '     权限:     Account → Workers Scripts → Edit\n'
+  printf '     区域资源: 包括 → 特定区域 → 选择 %s 所在 zone\n' "$DOMAIN"
+  printf '     （仅这两项，Token 读不到账号其他资源；创建后复制 Token 值）\n\n'
+  printf '%s' "② 粘贴 API Token（输入不回显）: "
+  IFS= read -rs TOKEN_VAL
+  printf '\n'
+  if [ -z "$TOKEN_VAL" ]; then
+    warn "未输入 Token，跳过自动开通配置"
+  else
+    TOKEN_JSON=""
+    TRY=0
+    while [ "$TRY" -lt 3 ]; do
+      TOKEN_JSON=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN_VAL" "https://api.cloudflare.com/client/v4/user/tokens/verify" || true)
+      [ -n "$TOKEN_JSON" ] && break
+      TRY=$((TRY + 1))
+      sleep 5
+    done
+    if printf '%s' "$TOKEN_JSON" | grep -q '"success":true'; then
+      ok "Token 校验通过"
+    else
+      die "Token 校验失败（确认粘贴完整）: ${TOKEN_JSON:-<无响应>}"
+    fi
+    DOM_JSON=""
+    TRY=0
+    while [ "$TRY" -lt 3 ]; do
+      DOM_JSON=$(curl -s --max-time 20 -H "Authorization: Bearer $TOKEN_VAL" "https://api.cloudflare.com/client/v4/accounts/$TOKEN_ACCT/workers/domains?per_page=1" || true)
+      [ -n "$DOM_JSON" ] && break
+      TRY=$((TRY + 1))
+      sleep 5
+    done
+    if printf '%s' "$DOM_JSON" | grep -q '"success":true'; then
+      ok "Workers 域名 API 可用（权限足够）"
+    else
+      die "域名 API 不可用（确认权限 Account→Workers Scripts→Edit 且区域资源含 ${DOMAIN}）: ${DOM_JSON:-<无响应>}"
+    fi
+    TOKEN_F="$SECRETS_DIR/CF_API_TOKEN.txt"
+    printf '%s' "$TOKEN_VAL" > "$TOKEN_F"
+    chmod 600 "$TOKEN_F"
+    # 不用 retry()：重定向的密钥文件 offset 会共享，重试时 wrangler 会读到空值；这里每次尝试重新打开文件
+    PUT_OK=0
+    TRY=0
+    while [ "$TRY" -lt 3 ]; do
+      if wrangler secret put CF_API_TOKEN --config "$DEPLOY_CFG" < "$TOKEN_F" >/dev/null; then
+        PUT_OK=1
+        break
+      fi
+      TRY=$((TRY + 1))
+      [ "$TRY" -lt 3 ] && { warn "设置 CF_API_TOKEN 失败（第 ${TRY} 次），10 秒后重试（Ctrl+C 可退出）"; sleep 10; }
+    done
+    [ "$PUT_OK" = "1" ] || die "wrangler secret put CF_API_TOKEN 失败（可手动重试: wrangler secret put CF_API_TOKEN --config $DEPLOY_CFG < ${TOKEN_F}）"
+    ok "CF_API_TOKEN 已写入 Worker，本地备份: $TOKEN_F"
+    if [ -f "$DEPLOY_ENV" ] && grep -q '^CF_ACCOUNT_ID=' "$DEPLOY_ENV"; then
+      TMP_ENV=$(mktemp)
+      grep -v '^CF_ACCOUNT_ID=' "$DEPLOY_ENV" > "$TMP_ENV"
+      printf 'CF_ACCOUNT_ID=%s\n' "$TOKEN_ACCT" >> "$TMP_ENV"
+      mv "$TMP_ENV" "$DEPLOY_ENV"
+    else
+      printf 'CF_ACCOUNT_ID=%s\n' "$TOKEN_ACCT" >> "$DEPLOY_ENV"
+    fi
+    chmod 600 "$DEPLOY_ENV" 2>/dev/null || true
+    ok "CF_ACCOUNT_ID 已写入 ${DEPLOY_ENV}"
+    # 重新生成配置，把 CF_ACCOUNT_ID 打进部署 vars（此前那次生成时还没有该值）
+    TENANT_SLUGS=$(db_slugs)
+    gen_deploy_config "$REMOTE_ID"
+  fi
+else
+  warn "已跳过：建租户后需跑 bash deploy.sh --code-only 才会注册其域名（控制台会提示）"
+fi
 
 # ══════════════════════ 4/5 部署 ══════════════════════
 stage "4/5 部署"

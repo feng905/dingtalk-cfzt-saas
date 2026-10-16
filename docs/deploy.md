@@ -66,11 +66,29 @@ bash deploy.sh --domain=example.com  # 非交互指定主域
 | 1 D1 | 确认建库 | `d1 list` 查重 → 不存在则 `d1 create`；生成 `wrangler.deploy.toml`（真实域+database_id） |
 | 2 建表 | 确认执行 | `d1 execute DB --config … --remote --file=schema.sql`（全部 `IF NOT EXISTS`，可重复跑） |
 | 3 Secrets | 展示一次 + 确认写入 | 生成 ENCRYPTION_KEY / STATE_SECRET / ADMIN_TOKEN，备份到 `.secrets/production/`（已 gitignore），逐个 `secret put --config …`；已存在的默认保留 |
+| 3.5 域名自动开通 | 可选，推荐确认 | 配置 CF_API_TOKEN + CF_ACCOUNT_ID，Worker 建租户时自己调 CF API 注册域名（见下节） |
 | 4 部署 | 最终确认 | `wrangler deploy --config wrangler.deploy.toml`（注册 deploy-check 入口与各租户主机名的 Custom Domain，DNS+证书自动签发） |
 | 5 验证 | 无（自动） | 新域名 /health、discovery issuer、/admin 401；老 Worker 两项回归比对 |
 | 附加 | 可跳过 | 可选：现场创建第一个租户，打印 client_id/secret 和 CF Access 五字段；确认后自动把其主机名加入路由并重新部署 |
 
 Secrets 只在生成时展示一次，之后保存在 `.secrets/production/`（权限 600），脚本不会回显。
+
+### 域名自动开通（3.5 阶段，可选但强烈推荐）
+
+配置后**建租户即自动注册域名**（Worker 调 Cloudflare API 挂 Custom Domain，DNS 与证书自动签发），
+控制台也会有「开通域名」按钮兜底；不配置则每次建完租户要跑一次 `bash deploy.sh --code-only`。
+
+脚本会引导你在 Cloudflare 控制台创建一个**最小权限** API Token：
+
+1. 打开 <https://dash.cloudflare.com/profile/api-tokens> → **创建令牌** → **创建自定义令牌**
+2. 权限：`Account` → `Workers Scripts` → `Edit`
+3. 区域资源：`包括` → `特定区域` → 选择部署主域所在的 zone
+   （仅这两项，Token 读不到账号里的其他资源）
+4. 创建后把 Token 值粘贴回脚本（输入不回显）；脚本会依次校验 Token 有效性与域名 API 权限，
+   然后写入 Worker Secret（本地备份 `.secrets/production/CF_API_TOKEN.txt`），
+   并把 `CF_ACCOUNT_ID` 记入 `.deploy.env`（从 whoami 自动提取，无需手填）
+
+已配置过的运行会自动跳过这一步（检测 Secret 已存在 + `.deploy.env` 有 Account ID）。
 
 ## 手工分步部署（与脚本等价）
 
@@ -129,23 +147,25 @@ curl -X POST https://deploy-check.sso.example.com/admin/tenants \
 
 ### 开通租户主机名路由
 
-租户创建后（管理控制台或 API 均可），其入口 `<slug>.sso.<主域>` 还需注册为
-Custom Domain 才能解析（自动建 DNS + 签发证书）。**脚本会自动从 D1 带出全部租户域名**：
+租户创建后，其入口 `<slug>.sso.<主域>` 还需注册为 Custom Domain 才能解析（自动建 DNS + 签发证书）。
+两条路径，按优先级：
+
+1. **自动开通（配置了 3.5 阶段后默认）**：创建租户时 Worker 现场注册，无需任何操作；
+   控制台域名卡上的「开通域名」按钮可对任何租户随时补挂（幂等）。
+2. **部署脚本路径**（未配置自动开通，或想一次性注册全部存量租户）：
 
 ```bash
 bash deploy.sh --code-only   # 只更新代码/路由：从 D1 读出所有租户，逐条注册后部署
 ```
 
 部署计划里会列出将注册的每个租户主机名，部署后轮询证书就绪。也可以在管理控制台
-（`https://deploy-check.sso.<主域>/admin/`）的「检测域名」按钮确认生效。
+（`https://deploy-check.sso.<主域>/admin/`）用「检测」按钮确认生效。
 
 `--add-domain=<主机名>` 仅用于注册**不在 D1 里的额外主机名**（追加到本地 `.tenant-domains`）。
 
 > ⚠️ **不要用 `npx wrangler deploy --config …` 直接更新代码**：本地生成的配置可能是旧的，
 > 而 wrangler 部署会**删除配置里没有的**租户域名（changeset replace 语义）。
 > `--code-only` 每次从 D1 重新生成配置，永远是最新全集。
-
-## 日常运维
 
 ## 日常运维
 

@@ -1,21 +1,25 @@
 /**
- * admin.js — 租户管理 API（Bearer ADMIN_TOKEN）+ 最简 HTML 控制台
+ * admin.js — 租户管理 API（Bearer ADMIN_TOKEN）+ HTML 控制台
  *
- * POST   /admin/tenants                     建租户（返回 client_id/secret，secret 只显示一次）
+ * POST   /admin/tenants                     建租户（返回 client_id/secret；配好域名 API 时自动开通租户域名）
  * GET    /admin/tenants                     列表
  * GET    /admin/tenants/:slug               详情
  * PATCH  /admin/tenants/:slug               改配置（corpIds/redirects/emailMode/status/anyRedirect）
  * DELETE /admin/tenants/:slug               停用（软删）
  * POST   /admin/tenants/:slug/rotate-key    轮换签名密钥（旧 key 转 retiring，仍可验签）
  * POST   /admin/tenants/:slug/rotate-client-secret  重置 OIDC client secret
+ * GET    /admin/tenants/:slug/client-secret 再次查看 client secret（密文存储，按需解密）
+ * POST   /admin/tenants/:slug/domain        开通租户域名（挂 Custom Domain，自动 DNS+证书）
+ * DELETE /admin/tenants/:slug/domain        摘掉租户域名
  * GET    /admin/tenants/:slug/logs?limit=50 登录审计
  * GET    /admin/                            HTML 控制台
  */
 
 import {
-  randomHex, sha256Hex, safeEq, generateRsaKey, aesEncrypt,
+  randomHex, sha256Hex, safeEq, generateRsaKey, aesEncrypt, aesDecrypt,
 } from "./core.js";
 import { isValidCfRedirect } from "./tenant.js";
+import { provisionDomain, detachDomain } from "./cfapi.js";
 
 function json(body, status = 200) {
   return new Response(JSON.stringify(body), {
@@ -30,6 +34,17 @@ function checkAuth(request, env) {
   const h = request.headers.get("Authorization") || "";
   if (!h.startsWith("Bearer ")) return false;
   return safeEq(h.slice(7).trim(), env.ADMIN_TOKEN || "");
+}
+
+/* 旧库升级：oidc_clients.secret_enc（client secret 密文，供控制台再次查看）。
+   幂等：已存在列时 ALTER 报错被吞掉；进程内只跑一次。 */
+let colsReady = false;
+async function ensureColumns(env) {
+  if (colsReady) return;
+  try {
+    await env.DB.prepare("ALTER TABLE oidc_clients ADD COLUMN secret_enc TEXT").run();
+  } catch (e) { /* 列已存在 */ }
+  colsReady = true;
 }
 
 const EMAIL_MODES = ["synthetic", "prefer_real"];
@@ -100,8 +115,9 @@ async function createTenant(request, env) {
         await aesEncrypt(env.ENCRYPTION_KEY, body.dtClientSecret || ""),
         JSON.stringify(f.redirects), f.anyRedirect ?? 0, f.emailMode || "synthetic", now, now),
       env.DB.prepare(
-        "INSERT INTO oidc_clients (client_id, tenant_slug, secret_hash, status, created_at) VALUES (?, ?, ?, 'active', ?)",
-      ).bind(clientId, slug, await sha256Hex(clientSecret), now),
+        "INSERT INTO oidc_clients (client_id, tenant_slug, secret_hash, secret_enc, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
+      ).bind(clientId, slug, await sha256Hex(clientSecret),
+        await aesEncrypt(env.ENCRYPTION_KEY, clientSecret), now),
       env.DB.prepare(
         "INSERT INTO signing_keys (tenant_slug, kid, private_key_enc, public_jwk, status, created_at) VALUES (?, ?, ?, ?, 'active', ?)",
       ).bind(slug, key.kid, await aesEncrypt(env.ENCRYPTION_KEY, key.privatePem),
@@ -114,11 +130,16 @@ async function createTenant(request, env) {
     return err(`db error: ${msg}`, 500);
   }
 
+  // 域名自动开通：配好 CF API 后建租户即上线；未配置时提示走部署脚本
+  const host = `${slug}.${env.SSO_BASE_DOMAIN}`;
+  const prov = await provisionDomain(env, host).catch((e) => ({ state: "error", detail: String(e) }));
+
   return json({
     slug,
-    // client_secret 只此一次明文展示
+    provision: { hostname: host, ...prov },
+    // client_secret 只此一次明文展示（之后可经 /client-secret 按需查看）
     oidc: {
-      issuer: `https://${slug}.${env.SSO_BASE_DOMAIN}`,
+      issuer: `https://${host}`,
       client_id: clientId,
       client_secret: clientSecret,
     },
@@ -144,7 +165,7 @@ async function listTenants(env) {
 
 async function getTenantDetail(env, slug) {
   const row = await env.DB.prepare(
-    `SELECT t.slug, t.status, t.corp_ids, t.allowed_redirects, t.any_redirect, t.email_mode, t.created_at, t.updated_at, c.client_id
+    `SELECT t.slug, t.status, t.corp_ids, t.dt_client_id, t.allowed_redirects, t.any_redirect, t.email_mode, t.created_at, t.updated_at, c.client_id
      FROM tenants t LEFT JOIN oidc_clients c ON c.tenant_slug = t.slug AND c.status = 'active'
      WHERE t.slug = ?`,
   ).bind(slug).first();
@@ -153,6 +174,7 @@ async function getTenantDetail(env, slug) {
     slug: row.slug,
     status: row.status,
     corpIds: JSON.parse(row.corp_ids),
+    dtClientId: row.dt_client_id,
     redirects: JSON.parse(row.allowed_redirects),
     anyRedirect: !!row.any_redirect,
     emailMode: row.email_mode,
@@ -209,10 +231,30 @@ async function rotateKey(env, slug) {
 async function rotateClientSecret(env, slug) {
   const newSecret = randomHex(24);
   const r = await env.DB.prepare(
-    "UPDATE oidc_clients SET secret_hash = ? WHERE tenant_slug = ? AND status = 'active'",
-  ).bind(await sha256Hex(newSecret), slug).run();
+    "UPDATE oidc_clients SET secret_hash = ?, secret_enc = ? WHERE tenant_slug = ? AND status = 'active'",
+  ).bind(await sha256Hex(newSecret), await aesEncrypt(env.ENCRYPTION_KEY, newSecret), slug).run();
   if (!r.meta || r.meta.changes === 0) return err("no active client for tenant", 404);
   return json({ slug, client_secret: newSecret }, 201);
+}
+
+/** 再次查看 client secret（AES 密文解密；旧租户没存密文时引导重置） */
+async function revealClientSecret(env, slug) {
+  const row = await env.DB.prepare(
+    "SELECT secret_enc FROM oidc_clients WHERE tenant_slug = ? AND status = 'active'",
+  ).bind(slug).first();
+  if (!row) return err("no active client for tenant", 404);
+  if (!row.secret_enc) return err("该租户的 secret 建于旧版本未存储密文，请重置 Client Secret", 404);
+  return json({ slug, client_secret: await aesDecrypt(env.ENCRYPTION_KEY, row.secret_enc) });
+}
+
+/** 开通/摘掉租户域名（Worker 自服务，调 Cloudflare API） */
+async function tenantDomain(env, slug, method) {
+  const exists = await env.DB.prepare("SELECT slug FROM tenants WHERE slug = ?").bind(slug).first();
+  if (!exists) return err("tenant not found", 404);
+  const host = `${slug}.${env.SSO_BASE_DOMAIN}`;
+  const fn = method === "DELETE" ? detachDomain : provisionDomain;
+  const r = await fn(env, host).catch((e) => ({ state: "error", detail: String(e) }));
+  return json({ hostname: host, ...r }, r.state === "error" ? 502 : 200);
 }
 
 async function tenantLogs(request, env, slug) {
@@ -238,6 +280,7 @@ export async function handleAdmin(request, env) {
     }
 
     if (!checkAuth(request, env)) return err("unauthorized", 401);
+    await ensureColumns(env);
 
     if (path === "/admin/tenants" && request.method === "POST") return await createTenant(request, env);
     if (path === "/admin/tenants" && request.method === "GET") return await listTenants(env);
@@ -249,6 +292,9 @@ export async function handleAdmin(request, env) {
       if (sub === "" && request.method === "DELETE") return await disableTenant(env, slug);
       if (sub === "/rotate-key" && request.method === "POST") return await rotateKey(env, slug);
       if (sub === "/rotate-client-secret" && request.method === "POST") return await rotateClientSecret(env, slug);
+      if (sub === "/client-secret" && request.method === "GET") return await revealClientSecret(env, slug);
+      if (sub === "/domain" && request.method === "POST") return await tenantDomain(env, slug, "POST");
+      if (sub === "/domain" && request.method === "DELETE") return await tenantDomain(env, slug, "DELETE");
       if (sub === "/logs" && request.method === "GET") return await tenantLogs(request, env, slug);
     }
     return err("not found", 404);
@@ -270,28 +316,30 @@ function adminHtml() {
   :root{
     --bg:#F6F8FA; --fg:#1C2530; --muted:#5F6E7E; --line:#DCE3EA; --card:#FFFFFF;
     --dt:#0B5FD9; --dt-soft:#E7F0FE; --cf:#B54E0E; --cf-soft:#FDEEDF;
-    --code-bg:#EEF2F6; --danger:#B42318; --danger-soft:#FDECEA; --ok:#1B7F4B;
+    --code-bg:#EEF2F6; --danger:#B42318; --danger-soft:#FDECEA; --ok:#1B7F4B; --ok-soft:#E8F5EE;
     --serif:"Noto Serif SC","Songti SC",serif; --sans:"Noto Sans SC","PingFang SC",sans-serif;
     --mono:"JetBrains Mono","SF Mono",Menlo,monospace;
   }
   @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
     --bg:#131A22; --fg:#E8EDF2; --muted:#94A4B5; --line:#2A3542; --card:#1A2330;
     --dt:#71A8FF; --dt-soft:#17273F; --cf:#FFA05C; --cf-soft:#33230F;
-    --code-bg:#202B38; --danger:#FF8A7A; --danger-soft:#3A1D18; --ok:#5BC48A;
+    --code-bg:#202B38; --danger:#FF8A7A; --danger-soft:#3A1D18; --ok:#5BC48A; --ok-soft:#14301F;
   }}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:15px;line-height:1.6}
   main{max-width:880px;margin:0 auto;padding:0 20px 64px}
   h1{font-family:var(--serif);font-size:1.45rem;margin:0 0 .2em}
-  h2{font-family:var(--serif);font-size:1.1rem;margin:2.2rem 0 .6rem;display:flex;align-items:center;gap:.5em}
+  h2{font-family:var(--serif);font-size:1.1rem;margin:2.2rem 0 .6rem;display:flex;align-items:center;gap:.5em;flex-wrap:wrap}
   h2 .tag{font-family:var(--sans);font-size:.68rem;font-weight:400;color:var(--muted)}
+  h3{font-size:.92rem;margin:.2rem 0 .4rem;display:flex;align-items:center;gap:.5em}
   .sub{color:var(--muted);font-size:.85rem;margin-bottom:1.2rem}
   .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1.1rem 1.2rem;margin:.8rem 0}
+  .card.dt{border-top:3px solid var(--dt)} .card.cf{border-top:3px solid var(--cf)}
   label{display:block;font-size:.8rem;color:var(--muted);margin:.7rem 0 .25rem}
   label b{color:var(--fg);font-weight:600}
   input,select{width:100%;padding:.5rem .65rem;border:1px solid var(--line);border-radius:8px;
     font-size:.9rem;background:var(--bg);color:var(--fg);font-family:var(--sans)}
-  input.mono,input[type=number]{font-family:var(--mono);font-size:.82rem}
+  input.mono{font-family:var(--mono);font-size:.82rem}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:0 1rem}
   @media (max-width:640px){.row{grid-template-columns:1fr}}
   button{padding:.5rem 1.1rem;border:0;border-radius:8px;background:var(--dt);color:#fff;
@@ -303,17 +351,17 @@ function adminHtml() {
   .hint{font-size:.8rem;color:var(--muted);margin-top:.35rem}
   .hint code,.tl-code{font-family:var(--mono);font-size:.78rem;background:var(--code-bg);
     padding:.1em .4em;border-radius:5px}
-  .five .frow{display:flex;align-items:center;gap:.6rem;padding:.55rem 0;border-bottom:1px dashed var(--line)}
-  .five .frow:last-child{border-bottom:0}
-  .five .fname{flex:0 0 118px;font-size:.8rem;color:var(--muted)}
-  .five .fval{flex:1;font-family:var(--mono);font-size:.82rem;word-break:break-all;min-width:0;
+  .frow{display:flex;align-items:center;gap:.6rem;padding:.55rem 0;border-bottom:1px dashed var(--line)}
+  .frow:last-child{border-bottom:0}
+  .frow .fname{flex:0 0 150px;font-size:.8rem;color:var(--muted)}
+  .frow .fval{flex:1;font-family:var(--mono);font-size:.82rem;word-break:break-all;min-width:0;
     background:var(--code-bg);padding:.35rem .55rem;border-radius:6px}
-  .five button{flex:0 0 auto}
-  .notice{border-left:3px solid var(--cf);background:var(--cf-soft);padding:.6rem .9rem;
-    border-radius:0 8px 8px 0;font-size:.85rem;margin:.8rem 0}
-  .notice.warn{border-left-color:var(--danger);background:var(--danger-soft)}
-  .notice.ok{border-left-color:var(--ok)}
-  .steps{margin:.4rem 0 .2rem;padding-left:1.3em;font-size:.87rem}
+  .frow button{flex:0 0 auto}
+  .group{border-left:3px solid var(--dt);background:var(--dt-soft);padding:.5rem .8rem;border-radius:0 8px 8px 0;font-size:.85rem;margin:.8rem 0}
+  .group.cf{border-left-color:var(--cf);background:var(--cf-soft)}
+  .group.ok{border-left-color:var(--ok);background:var(--ok-soft)}
+  .group.bad{border-left-color:var(--danger);background:var(--danger-soft)}
+  .steps{margin:.4rem 0 .2rem;padding-left:1.3em;font-size:.85rem}
   .steps li{margin:.3rem 0}
   table{width:100%;border-collapse:collapse;font-size:.85rem}
   th,td{padding:.5rem .4rem;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
@@ -335,8 +383,8 @@ function adminHtml() {
 <body>
 <main>
 <h1>钉钉 → Cloudflare Zero Trust 控制台</h1>
-<p class="sub">Admin Token 只保存在本浏览器（localStorage），不会发往除本服务以外的任何地方。
-本地备份在仓库 <code class="tl-code">.secrets/production/ADMIN_TOKEN.txt</code>。</p>
+<p class="sub">Admin Token 只保存在本浏览器（localStorage）。本地备份在仓库
+<code class="tl-code">.secrets/production/ADMIN_TOKEN.txt</code>。</p>
 
 <h2>1 · 连接 <span class="tag">首次使用填一次</span></h2>
 <div class="card">
@@ -345,7 +393,7 @@ function adminHtml() {
     <input id="token" type="password" class="mono" placeholder="ADMIN_TOKEN" autocomplete="off">
     <button class="sec" id="btn-load">连接并加载</button>
   </div>
-  <p class="hint">连接失败会提示 unauthorized —— 检查 token 是否为 ADMIN_TOKEN 那一个（不是租户的 client_secret）。</p>
+  <p class="hint">提示 unauthorized 就是 token 不对（是 ADMIN_TOKEN，不是租户的 client_secret）。</p>
 </div>
 
 <h2>2 · 创建租户 <span class="tag">客户 BYO：用客户钉钉应用的 AppKey/AppSecret</span></h2>
@@ -379,7 +427,7 @@ function adminHtml() {
       <label><b>redirects</b>（客户 CF 团队回调，JSON 数组）</label>
       <input id="f-redirects" class="mono"
         value='["https://REPLACE-team.cloudflareaccess.com/cdn-cgi/access/callback"]'>
-      <p class="hint">把 REPLACE-team 换成客户的 CF Zero Trust 团队名（xxx.cloudflareaccess.com 的 xxx）。</p>
+      <p class="hint">把 REPLACE-team 换成客户 CF 团队名（xxx.cloudflareaccess.com 的 xxx）。</p>
     </div>
   </div>
   <div style="margin-top:1rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap">
@@ -391,31 +439,7 @@ function adminHtml() {
   <pre id="create-err" class="hide"></pre>
 </div>
 
-<div id="created" class="hide">
-  <h2>3 · 填进 Cloudflare Zero Trust <span class="tag">集成 → 标识提供程序 → 添加 → OpenID Connect</span></h2>
-  <div class="card five" id="five-cards"></div>
-  <div class="notice">
-    <b>在 CF Zero Trust 里的操作：</b>
-    <ol class="steps">
-      <li>Cloudflare Dashboard → <b>Zero Trust</b> → <b>集成</b> → <b>标识提供程序（登录方法）</b> → 添加 → <b>OpenID Connect</b></li>
-      <li>把上面五个字段逐个填入；<b>PKCE 不要勾选</b></li>
-      <li>保存后在本方法上点「测试」，用钉钉 App 扫码完成验证</li>
-    </ol>
-  </div>
-  <div class="notice warn">
-    <b>client_secret 只显示这一次</b>（服务端只存哈希）。关掉页面前务必复制；丢了就点「重置 Client Secret」重新生成。
-  </div>
-  <div class="card">
-    <label><b>租户域名连通性</b></label>
-    <p class="hint" style="margin:0 0 .6rem">
-      租户域名 <code class="tl-code" id="probe-host">-</code> 由部署脚本注册（DNS + 证书自动签发）。
-      刚创建完打不开是正常的 —— 在<b>服务器仓库目录</b>运行一次
-      <code class="tl-code">bash deploy.sh --code-only</code>，脚本会自动把所有租户域名注册上线，然后回来点下面的按钮。
-    </p>
-    <button class="sec sm" id="btn-probe-new">检测域名是否已开通</button>
-    <span id="probe-out-new" style="font-size:.85rem;margin-left:.6rem"></span>
-  </div>
-</div>
+<div id="created" class="hide"></div>
 
 <h2>租户列表</h2>
 <div class="card" style="padding:.4rem .9rem">
@@ -438,7 +462,7 @@ var BASE = location.hostname.replace(/^deploy-check\\./, "");
 function toast(msg){
   var t = $("toast");
   t.textContent = msg; t.classList.add("show");
-  setTimeout(function(){ t.classList.remove("show"); }, 1600);
+  setTimeout(function(){ t.classList.remove("show"); }, 1800);
 }
 function getToken(){ return $("token").value.trim(); }
 function api(path, opts){
@@ -453,50 +477,117 @@ function api(path, opts){
   });
 }
 function copyText(v, btn){
-  var done = function(){ if(btn){ var o=btn.textContent; btn.textContent="已复制"; setTimeout(function(){btn.textContent=o;},1200);} toast("已复制"); };
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(v).then(done, function(){ fallback(); });
-  } else { fallback(); }
+  function done(){ if(btn){ var o=btn.textContent; btn.textContent="已复制"; setTimeout(function(){btn.textContent=o;},1200);} toast("已复制"); }
   function fallback(){
     var ta = document.createElement("textarea");
     ta.value = v; document.body.appendChild(ta); ta.select();
     try { document.execCommand("copy"); } catch(e) {}
     document.body.removeChild(ta); done();
   }
+  if (navigator.clipboard && navigator.clipboard.writeText)
+    navigator.clipboard.writeText(v).then(done, fallback);
+  else fallback();
 }
-function fieldRow(name, value, isSecret){
-  var row = document.createElement("div"); row.className = "frow";
-  var n = document.createElement("div"); n.className = "fname"; n.textContent = name;
-  var val = document.createElement("div"); val.className = "fval";
-  val.textContent = isSecret ? value : value;
-  var b = document.createElement("button"); b.className = "sec sm"; b.textContent = "复制";
+function el(tag, cls, text){
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+/* 键值行（带复制按钮） */
+function fieldRow(name, value){
+  var row = el("div", "frow");
+  row.appendChild(el("div", "fname", name));
+  row.appendChild(el("div", "fval", value));
+  var b = el("button", "sec sm", "复制");
   b.addEventListener("click", function(){ copyText(value, b); });
-  row.appendChild(n); row.appendChild(val); row.appendChild(b);
+  row.appendChild(b);
   return row;
 }
-/* CF Access OIDC 五字段卡片：label 顺序与 CF 表单一一对应 */
-function fiveFields(tenantHost, clientId, clientSecret){
-  var box = $("five-cards"); box.textContent = "";
-  var mk = function(t){ var h=document.createElement("div"); h.className="hint"; h.style.margin=".6rem 0 .2rem"; h.textContent=t; box.appendChild(h); };
-  mk("「Auth URL」填：");
-  box.appendChild(fieldRow("Auth URL", "https://" + tenantHost + "/authorize"));
-  mk("「Token URL」填：");
-  box.appendChild(fieldRow("Token URL", "https://" + tenantHost + "/token"));
-  mk("「Certificate URL」填：");
-  box.appendChild(fieldRow("Certificate URL", "https://" + tenantHost + "/jwks"));
-  mk("「Client ID / Client Secret」填：");
-  box.appendChild(fieldRow("Client ID", clientId));
-  box.appendChild(fieldRow("Client Secret", clientSecret, true));
-  var issuer = document.createElement("p"); issuer.className = "hint"; issuer.style.marginTop = ".7rem";
-  issuer.textContent = "issuer（discovery/自检用）：https://" + tenantHost;
-  box.appendChild(issuer);
+function card(title, cls){
+  var c = el("div", "card" + (cls ? " " + cls : ""));
+  c.appendChild(el("h3", null, title));
+  return c;
 }
+function notice(text, kind){
+  return el("div", "group" + (kind ? " " + kind : ""), text);
+}
+/* 探测域名是否已开通：no-cors fetch，DNS 失败会 reject */
 function probe(host, out){
   out.style.color = "var(--muted)"; out.textContent = "检测中…";
   fetch("https://" + host + "/health", { mode: "no-cors", cache: "no-store" })
     .then(function(){ out.style.color = "var(--ok)"; out.textContent = "✔ 已开通并可访问"; })
     .catch(function(){ out.style.color = "var(--danger)";
-      out.textContent = "✘ 还没开通（域名解析不到）—— 跑 bash deploy.sh --code-only 后再试"; });
+      out.textContent = "✘ 还没开通 —— 点「开通域名」注册后再试"; });
+}
+/* 开通域名：调 Worker 自服务 API；返回 promise 便于串检测 */
+function provisionBtn(host, slug, out){
+  var b = el("button", "sec sm", "开通域名");
+  b.addEventListener("click", function(){
+    out.style.color = "var(--muted)"; out.textContent = "注册中…（DNS + 证书签发约 1-2 分钟）";
+    api("/tenants/" + slug + "/domain", { method: "POST" }).then(function(r){
+      if (r.state === "created")      { out.style.color = "var(--ok)";    out.textContent = "✔ 已注册，等 1-2 分钟后点「检测」"; }
+      else if (r.state === "already") { out.style.color = "var(--ok)";    out.textContent = "✔ 已在本服务名下，点「检测」确认"; }
+      else if (r.state === "disabled"){ out.style.color = "var(--cf)";    out.textContent = "· 未配置自动开通 —— 在服务器跑 bash deploy.sh 配置（会引导建 API Token）"; }
+      else out.style.color = "var(--danger)", out.textContent = "✘ " + (r.detail || "失败");
+    }).catch(function(e){
+      out.style.color = "var(--danger)"; out.textContent = "✘ " + e.message;
+    });
+  });
+  return b;
+}
+function probeBtn(host, out){
+  var b = el("button", "sec sm", "检测");
+  b.addEventListener("click", function(){ probe(host, out); });
+  return b;
+}
+function domainCard(slug){
+  var host = slug + "." + BASE;
+  var c = card("租户域名 · https://" + host, "dt");
+  var out = el("span"); out.style.fontSize = ".85rem"; out.style.marginLeft = ".5rem";
+  var acts = el("div", "acts");
+  acts.appendChild(provisionBtn(host, slug, out));
+  acts.appendChild(probeBtn(host, out));
+  c.appendChild(acts);
+  c.appendChild(el("p", "hint", "域名注册 = 挂 Custom Domain，DNS 与证书自动签发；正常 1-2 分钟生效。若自动开通未配置，也可在服务器跑 bash deploy.sh --code-only 注册现有租户域名。"));
+  return { card: c, out: out };
+}
+/* —— CF Access OIDC 五字段卡片 —— */
+function cfCard(host, clientId){
+  var c = card("在 Cloudflare Zero Trust 填（OIDC 登录方法）", "cf");
+  c.appendChild(fieldRow("Auth URL", "https://" + host + "/authorize"));
+  c.appendChild(fieldRow("Token URL", "https://" + host + "/token"));
+  c.appendChild(fieldRow("Certificate URL", "https://" + host + "/jwks"));
+  c.appendChild(fieldRow("Client ID", clientId));
+  c.appendChild(el("p", "hint", "Client Secret 用「查看 Secret」取 —— 在下面这一步之后。"));
+  var ol = el("ol", "steps");
+  [["Cloudflare Dashboard → Zero Trust → 集成 → 标识提供程序 → 添加 → OpenID Connect"],
+   ["把上面字段逐个填入，PKCE 不要勾选"],
+   ["保存后在该登录方法上点「测试」，用钉钉 App 扫码验证"]].forEach(function(x){
+    ol.appendChild(el("li", null, x[0]));
+  });
+  c.appendChild(ol);
+  return c;
+}
+/* —— 钉钉开放平台卡片 —— */
+function dingCard(host, dtClientId, corpIds, emailMode){
+  var c = card("在钉钉开放平台填（客户的企业内部应用）", "dt");
+  c.appendChild(fieldRow("重定向URL（回调地址）", "https://" + host + "/cb"));
+  var ol = el("ol", "steps");
+  ol.appendChild(el("li", null, "应用详情 → 安全设置 → 重定向 URL（回调地址）：新增上面这条，必须一字不差（https 和 /cb 路径）"));
+  ol.appendChild(el("li", null, "权限管理：开通「通讯录个人信息读权限」（扫码登录读取用户身份必需）"));
+  ol.appendChild(el("li", null, "凭证与基础信息里拿到的 AppKey / AppSecret，就是创建租户时填的 dtClientId / dtClientSecret"
+    + (dtClientId ? "（当前保存的 AppKey：" + dtClientId + "）" : "")));
+  c.appendChild(ol);
+  c.appendChild(el("p", "hint", "准入 corpId：" + JSON.stringify(corpIds || [])
+    + " —— 不在名单内的钉钉组织扫码会被拒绝。" + (emailMode ? " email 模式：" + emailMode + "。" : "")));
+  return c;
+}
+function secretOnce(host, clientId, clientSecret){
+  var c = card("Client Secret（已加密保存，可随时再看）", "cf");
+  c.appendChild(fieldRow("Client Secret", clientSecret));
+  c.appendChild(el("p", "hint", "服务端只存密文与哈希；租户列表的「查看 Secret」随时可再取。若怀疑泄露请「重置」。"));
+  return c;
 }
 
 $("slug-preview").textContent = "";
@@ -527,21 +618,31 @@ $("btn-create").addEventListener("click", function(){
   }
   api("/tenants", { method: "POST", body: JSON.stringify(body) }).then(function(out){
     var host = body.slug + "." + BASE;
-    $("created").classList.remove("hide");
-    fiveFields(host, out.oidc.client_id, out.oidc.client_secret);
-    $("probe-host").textContent = "https://" + host;
-    $("probe-out-new").textContent = "";
-    var b = $("btn-probe-new"), nb = b.cloneNode(true);
-    b.parentNode.replaceChild(nb, b);
-    nb.addEventListener("click", function(){ probe(host, $("probe-out-new")); });
-    toast("租户已创建，把五字段填进 CF Zero Trust");
+    var box = $("created"); box.classList.remove("hide"); box.textContent = "";
+    box.appendChild(el("h2", null, "3 · 按两边提示配置"));
+    box.appendChild(dingCard(host, body.dtClientId, body.corpIds, body.emailMode));
+    box.appendChild(cfCard(host, out.oidc.client_id));
+    box.appendChild(secretOnce(host, out.oidc.client_id, out.oidc.client_secret));
+    var dc = domainCard(body.slug);
+    if (out.provision) {
+      if (out.provision.state === "created")
+        dc.out.style.color = "var(--ok)", dc.out.textContent = "✔ 已自动注册（创建租户时）";
+      else if (out.provision.state === "already")
+        dc.out.style.color = "var(--ok)", dc.out.textContent = "✔ 已在本服务名下";
+      else if (out.provision.state === "disabled")
+        dc.out.style.color = "var(--cf)", dc.out.textContent = "· 未配置自动开通 API —— 跑一次 bash deploy.sh 配置（会引导建 Token）；其间可用下方按钮";
+      else
+        dc.out.style.color = "var(--danger)", dc.out.textContent = "✘ " + (out.provision.detail || "自动开通失败");
+    }
+    box.appendChild(dc.card);
+    box.appendChild(notice("保存后回到 Cloudflare 的登录方法上点「测试」扫码；打不开租户域名先点上面「检测」。", "cf"));
+    toast("租户已创建");
     loadTenants();
-    $("created").scrollIntoView({ behavior: "smooth", block: "start" });
+    box.scrollIntoView({ behavior: "smooth", block: "start" });
   }).catch(function(e){
     pre.textContent = "创建失败: " + e.message; pre.classList.remove("hide");
   });
 });
-$("btn-probe-new").addEventListener("click", function(){ /* 创建成功后被替换绑定 */ });
 
 function loadTenants(){
   api("/tenants").then(function(d){
@@ -554,40 +655,26 @@ function loadTenants(){
     }
     d.tenants.forEach(function(t){
       var tr = document.createElement("tr");
-      var mk = function(v, mono){
-        var td = document.createElement("td");
-        if (mono) { var c = document.createElement("code"); c.textContent = v || "-"; td.appendChild(c); }
-        else td.textContent = v;
-        return td;
-      };
-      tr.appendChild(mk(t.slug));
-      var st = mk("", false);
-      var bd = document.createElement("span");
-      bd.className = "badge" + (t.status === "active" ? "" : " off");
-      bd.textContent = t.status;
+      tr.appendChild(el("td", null, t.slug));
+      var st = el("td"); var bd = el("span", "badge" + (t.status === "active" ? "" : " off"), t.status);
       st.appendChild(bd); tr.appendChild(st);
-      tr.appendChild(mk(t.clientId, true));
-      var act = document.createElement("td"); act.className = "acts";
+      var cid = el("td"); var cc = el("code", null, t.clientId || "-"); cid.appendChild(cc); tr.appendChild(cid);
+      var act = el("td"); act.className = "acts";
       var addBtn = function(label, cls, fn){
-        var b = document.createElement("button");
-        b.className = "sec sm" + (cls ? " " + cls : ""); b.textContent = label;
+        var b = el("button", "sec sm" + (cls ? " " + cls : ""), label);
         b.addEventListener("click", fn); act.appendChild(b);
       };
       addBtn("详情", "", function(){ showDetail(t.slug); });
+      addBtn("查看 Secret", "", function(){ showSecret(t.slug); });
       addBtn("日志", "", function(){ showLogs(t.slug); });
       addBtn(t.status === "active" ? "停用" : "启用", t.status === "active" ? "warn" : "",
         function(){ setStatus(t.slug, t.status === "active" ? "disabled" : "active"); });
-      addBtn("检测域名", "", function(){
-        var out = document.createElement("span");
-        out.style.fontSize = ".8rem"; out.style.marginLeft = ".4rem";
-        act.appendChild(out); probe(t.slug + "." + BASE, out);
-      });
       tr.appendChild(act);
       tb.appendChild(tr);
     });
   }).catch(function(e){
-    if ((e.message || "").indexOf("unauthorized") >= 0 || (e.message || "").indexOf("Unauthorized") >= 0)
-      toast("token 不对或没填 —— 先在上方连接");
+    var m = (e.message || "").toLowerCase();
+    if (m.indexOf("unauthorized") >= 0) toast("token 不对或没填 —— 先在上方连接");
     else toast("加载失败: " + e.message);
   });
 }
@@ -596,72 +683,66 @@ function setStatus(slug, status){
     .then(function(){ toast(slug + " → " + status); loadTenants(); showDetail(slug); })
     .catch(function(e){ toast("失败: " + e.message); });
 }
+function showSecret(slug){
+  api("/tenants/" + slug + "/client-secret").then(function(r){
+    var box = $("detail"); box.classList.remove("hide"); box.textContent = "";
+    box.appendChild(el("h2", null, "Client Secret · " + slug));
+    var c = card("查看 Secret（加密存储，按需解密）", "cf");
+    c.appendChild(fieldRow("Client Secret", r.client_secret));
+    c.appendChild(el("p", "hint", "只交给客户配 CF Access 用；怀疑泄露就「重置 Client Secret」。"));
+    box.appendChild(c);
+    box.scrollIntoView({ behavior: "smooth", block: "start" });
+  }).catch(function(e){ toast("取 Secret 失败: " + e.message); });
+}
 function showDetail(slug){
   api("/tenants/" + slug).then(function(t){
-    var box = $("detail"); box.classList.remove("hide");
-    box.textContent = "";
-    var h = document.createElement("h2"); h.textContent = "详情 · " + t.slug; box.appendChild(h);
-    var card = document.createElement("div"); card.className = "card five";
     var host = t.slug + "." + BASE;
-    var put = function(label, value){
-      var p = document.createElement("p"); p.className = "hint"; p.style.margin = ".5rem 0 .1rem";
-      p.textContent = label; card.appendChild(p);
-      card.appendChild(fieldRow(label, value));
-    };
-    put("issuer", "https://" + host);
-    put("Auth URL", "https://" + host + "/authorize");
-    put("Token URL", "https://" + host + "/token");
-    put("Certificate URL (JWKS)", "https://" + host + "/jwks");
-    put("Client ID", t.clientId);
-    var meta = document.createElement("div"); meta.className = "card";
-    meta.innerHTML = "";
+    var box = $("detail"); box.classList.remove("hide"); box.textContent = "";
+    box.appendChild(el("h2", null, "详情 · " + t.slug));
+    box.appendChild(dingCard(host, t.dtClientId, t.corpIds, t.emailMode));
+    box.appendChild(cfCard(host, t.clientId));
+    var dc = domainCard(t.slug);
+    box.appendChild(dc.card);
+    var meta = card("配置与运维");
     var line = function(k, v){
-      var p = document.createElement("p"); p.style.margin = ".3rem 0"; p.style.fontSize = ".87rem";
-      var b = document.createElement("b"); b.textContent = k + "：";
-      p.appendChild(b); p.appendChild(document.createTextNode(v));
+      var p = el("p", null); p.style.margin = ".3rem 0"; p.style.fontSize = ".87rem";
+      p.appendChild(el("b", null, k + "：")); p.appendChild(document.createTextNode(v));
       meta.appendChild(p);
     };
     line("状态", t.status);
-    line("corpIds", JSON.stringify(t.corpIds));
     line("允许的回调", t.redirects.join("，") + (t.anyRedirect ? "（任意回调域：开）" : ""));
-    line("emailMode", t.emailMode);
-    var note = document.createElement("p"); note.className = "hint";
-    note.textContent = "Client Secret 服务端不存明文 —— 只在创建或「重置 Client Secret」时显示一次。";
-    meta.appendChild(note);
-    var acts = document.createElement("div"); acts.className = "acts";
+    var acts = el("div", "acts");
     var mkBtn = function(label, cls, fn){
-      var b = document.createElement("button");
-      b.className = "sec sm" + (cls ? " " + cls : ""); b.textContent = label;
+      var b = el("button", "sec sm" + (cls ? " " + cls : ""), label);
       b.addEventListener("click", fn); acts.appendChild(b);
     };
+    mkBtn("查看 Secret", "", function(){ showSecret(slug); });
     mkBtn("轮换签名密钥", "", function(){
       api("/tenants/" + slug + "/rotate-key", { method: "POST" })
-        .then(function(r){ toast("已轮换 kid=" + r.newKid); showDetail(slug); })
+        .then(function(r){ toast("已轮换 kid=" + r.newKid); })
         .catch(function(e){ toast("失败: " + e.message); });
     });
     mkBtn("重置 Client Secret", "warn", function(){
       api("/tenants/" + slug + "/rotate-client-secret", { method: "POST" })
         .then(function(r){
-          var c2 = document.createElement("div"); c2.className = "card five";
-          c2.appendChild(fieldRow("新 Client Secret（只显示这一次）", r.client_secret, true));
+          var c2 = card("新 Client Secret（旧的可继续「查看」前已被覆盖）", "cf");
+          c2.appendChild(fieldRow("新 Client Secret", r.client_secret));
           box.insertBefore(c2, meta);
         })
         .catch(function(e){ toast("失败: " + e.message); });
     });
-    mkBtn("检测域名", "", function(){
-      var out = document.createElement("span"); out.style.fontSize = ".85rem"; out.style.marginLeft = ".5rem";
-      acts.appendChild(out); probe(host, out);
-    });
+    mkBtn(t.status === "active" ? "停用租户" : "启用租户", t.status === "active" ? "warn" : "",
+      function(){ setStatus(slug, t.status === "active" ? "disabled" : "active"); });
     meta.appendChild(acts);
-    box.appendChild(card); box.appendChild(meta);
+    box.appendChild(meta);
     box.scrollIntoView({ behavior: "smooth", block: "start" });
   }).catch(function(e){ toast("加载详情失败: " + e.message); });
 }
 function showLogs(slug){
   api("/tenants/" + slug + "/logs?limit=50").then(function(d){
     var box = $("logs"); box.classList.remove("hide"); box.textContent = "";
-    var h = document.createElement("h2"); h.textContent = "登录审计 · " + slug; box.appendChild(h);
-    var card = document.createElement("div"); card.className = "card"; card.style.padding = ".4rem .9rem";
+    box.appendChild(el("h2", null, "登录审计 · " + slug));
+    var card1 = el("div", "card"); card1.style.padding = ".4rem .9rem";
     var tb = document.createElement("table");
     var thead = document.createElement("thead");
     thead.innerHTML = "<tr><th>时间</th><th>union_id</th><th>动作</th><th>详情</th></tr>";
@@ -670,17 +751,16 @@ function showLogs(slug){
     (d.logs || []).forEach(function(l){
       var tr = document.createElement("tr");
       [new Date(l.ts).toLocaleString(), l.union_id, l.action, l.detail || ""].forEach(function(v){
-        var td = document.createElement("td"); td.textContent = v; tr.appendChild(td);
+        tr.appendChild(el("td", null, v));
       });
       tbody.appendChild(tr);
     });
     if (!d.logs || !d.logs.length) {
       var tr = document.createElement("tr");
-      var td = document.createElement("td"); td.colSpan = 4; td.className = "hint";
-      td.textContent = "暂无记录";
-      tr.appendChild(td); tbody.appendChild(tr);
+      tr.appendChild(el("td", "hint", "暂无记录")).colSpan = 4;
+      tbody.appendChild(tr);
     }
-    tb.appendChild(tbody); card.appendChild(tb); box.appendChild(card);
+    tb.appendChild(tbody); card1.appendChild(tb); box.appendChild(card1);
     box.scrollIntoView({ behavior: "smooth", block: "start" });
   }).catch(function(e){ toast("加载日志失败: " + e.message); });
 }

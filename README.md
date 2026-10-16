@@ -51,8 +51,10 @@ bash deploy.sh             # 正式部署（全程交互确认）
 **路由按租户逐条注册**：Custom Domains 不支持通配符，每个主机名
 （`deploy-check.sso.<主域>` 管理入口 + 各租户 `<slug>.sso.<主域>`）单独注册为
 Custom Domain，Cloudflare 自动建 DNS 并签发证书（两级子域也免费覆盖）。
-**部署脚本自动从 D1 带出全部租户域名**——建完租户跑一次
-`bash deploy.sh --code-only` 即可开通；改代码更新也用同一条命令
+**部署脚本自动从 D1 带出全部租户域名**；部署时可选配置「域名自动开通」
+（最小权限 API Token，见 [docs/deploy.md](docs/deploy.md)），配置后
+**建租户即自动注册域名，控制台也有「开通域名」按钮兜底**；未配置则建完租户跑一次
+`bash deploy.sh --code-only` 开通，改代码更新也用同一条命令
 （不要直接 `wrangler deploy`：本地生成的配置可能是旧的，会删掉新租户的域名）。
 完整步骤、手工等价命令、运维操作见 [docs/deploy.md](docs/deploy.md)。
 
@@ -62,7 +64,7 @@ Custom Domain，Cloudflare 自动建 DNS 并签发证书（两级子域也免费
 
 ```bash
 T="Authorization: Bearer $ADMIN_TOKEN"
-# 建租户（返回的 client_secret 只显示一次，直接给客户配 CF Access）
+# 建租户（client_secret 已加密保存，随时可再查；同时自动开通租户域名——若已配置自动开通）
 curl -X POST https://admin host/admin/tenants -H "$T" -H "Content-Type: application/json" -d '{
   "slug": "acme",
   "corpIds": ["dingxxxxxxxxxxxxxxxx"],          # 客户钉钉组织的 corpId，["*"]=不限
@@ -71,7 +73,9 @@ curl -X POST https://admin host/admin/tenants -H "$T" -H "Content-Type: applicat
   "redirects": ["https://acme-team.cloudflareaccess.com/cdn-cgi/access/callback"]
 }'
 curl -s -H "$T" .../admin/tenants               # 列表
-curl -s -H "$T" .../admin/tenants/acme          # 详情
+curl -s -H "$T" .../admin/tenants/acme          # 详情（含钉钉 AppKey、状态、域名等）
+curl -s -H "$T" .../admin/tenants/acme/client-secret                      # 再次查看 client secret
+curl -X POST -H "$T" .../admin/tenants/acme/domain                        # 开通/补挂租户域名（幂等）
 curl -X PATCH -H "$T" -d '{"status":"disabled"}' .../admin/tenants/acme   # 停用
 curl -X POST -H "$T" .../admin/tenants/acme/rotate-key                    # 轮换签名密钥
 curl -s -H "$T" .../admin/tenants/acme/logs?limit=50                      # 登录审计

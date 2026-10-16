@@ -145,6 +145,14 @@ echo "$LOGS" | grep -q '"action":"login_ok"' && ok "audit 有 login_ok" || bad "
 LOGS_B=$(curl -s $ADMIN/admin/tenants/demo-b/logs -H "Authorization: Bearer $ADMIN_TOKEN")
 echo "$LOGS_B" | grep -q 'corpId denied' && ok "audit 有 corpId 拒绝记录" || bad "audit 缺 corpId 拒绝: $LOGS_B"
 
+echo "▶ 10. Secret 查看与域名开通降级"
+REVEAL=$(curl -s $ADMIN/admin/tenants/demo/client-secret -H "Authorization: Bearer $ADMIN_TOKEN")
+check "client-secret 可再次查看（与创建时一致）" "$(echo "$REVEAL" | jqval "['client_secret']")" "$CSEC"
+DOM=$(curl -s -X POST $ADMIN/admin/tenants/demo/domain -H "Authorization: Bearer $ADMIN_TOKEN")
+check "domain state=disabled（未配置 CF_API_TOKEN → 部署脚本路径降级）" "$(echo "$DOM" | jqval "['state']")" "disabled"
+DETAIL=$(curl -s $ADMIN/admin/tenants/demo -H "Authorization: Bearer $ADMIN_TOKEN")
+check "详情含钉钉 AppKey（dtClientId）" "$(echo "$DETAIL" | jqval "['dtClientId']")" "dt-mock-id"
+
 echo ""
 echo "════════════════════════════"
 echo "结果: PASS=$PASS FAIL=$FAIL"

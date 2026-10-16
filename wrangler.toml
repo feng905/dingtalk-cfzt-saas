@@ -34,6 +34,13 @@ DT_LOGIN_BASE = "https://login.dingtalk.com"
 # 本地开发默认租户（仅 hostname 为 localhost 时生效）
 DEV_TENANT = "demo"
 
+# Worker 自服务开通租户域名（调 Cloudflare API 挂 Custom Domain）。
+# CF_API_TOKEN 是 Secret（deploy.sh 的「域名自动开通」阶段写入）；
+# CF_ACCOUNT_ID 由 deploy.sh 从 whoami 提取并替换占位符；
+# 两者缺一或仍是占位符时，控制台的「开通域名」会提示走部署脚本路径。
+CF_ACCOUNT_ID = "PLACEHOLDER_DEPLOY_SCRIPT_WILL_FILL"
+WORKER_NAME = "dingtalk-cfzt-saas"
+
 [[d1_databases]]
 binding = "DB"
 database_name = "dingtalk-saas"
