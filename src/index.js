@@ -2,10 +2,12 @@
  * index.js — 路由入口
  *   /health                    健康检查
  *   /admin/*                   管理面（Bearer ADMIN_TOKEN）
+ *   /docs/*                    客户接入文档（按租户 Host 填真实值）
  *   其余                       租户 OIDC 端点（Host 决定租户）
  */
 
 import { handleAdmin } from "./admin.js";
+import { handleDocs } from "./docs.js";
 import {
   handleDiscovery, handleAuthorize, handleCallback, handleToken, handleUserinfo, handleJwks,
 } from "./oidc.js";
@@ -26,6 +28,7 @@ export default {
     try {
       if (path === "/health") return json({ ok: true, ts: Date.now() });
       if (path === "/admin" || path.startsWith("/admin/")) return await handleAdmin(request, env);
+      if (path === "/docs" || path.startsWith("/docs/")) return await handleDocs(request, env, path);
 
       // 租户 OIDC 面：无有效租户 host 一律 404
       const slug = tenantSlugFromRequest(request, env);

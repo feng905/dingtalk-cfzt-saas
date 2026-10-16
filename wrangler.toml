@@ -18,6 +18,11 @@ name = "dingtalk-cfzt-saas"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+# 客户文档 markdown 以文本模块打进 Worker（/docs 路由按租户 Host 替换真实值后伺服）
+[[rules]]
+type = "Text"
+globs = ["**/*.md"]
+
 # ROUTES_PLACEHOLDER —— deploy.sh 生成配置时替换为真实 routes 数组
 
 # 落地页等静态文件（/ 由 public/index.html 提供，其余路径走 Worker）

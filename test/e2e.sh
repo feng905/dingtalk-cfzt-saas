@@ -153,6 +153,29 @@ check "domain state=disabled（未配置 CF_API_TOKEN → 部署脚本路径降�
 DETAIL=$(curl -s $ADMIN/admin/tenants/demo -H "Authorization: Bearer $ADMIN_TOKEN")
 check "详情含钉钉 AppKey（dtClientId）" "$(echo "$DETAIL" | jqval "['dtClientId']")" "dt-mock-id"
 
+echo "▶ 11. /docs 在线文档（按租户填真实值）"
+RESOLVE_CHECK="--resolve deploy-check.sso.example.com:8787:127.0.0.1"
+DOCS_HTML=$(curl -s $RESOLVE "$W/docs")
+printf '%s' "$DOCS_HTML" | grep -q '<meta charset="utf-8">' && ok "文档页声明 charset" || bad "文档页缺 charset"
+printf '%s' "$DOCS_HTML" | grep -q "demo.sso.example.com" && ok "租户文档填入真实域名" || bad "文档未填入真实域名"
+DOCS_D1=$(curl -s $RESOLVE "$W/docs/1-dingtalk-app")
+printf '%s' "$DOCS_D1" | grep -q "https://demo.sso.example.com/cb" && ok "租户文档填入真实回调地址" || bad "文档缺真实回调地址"
+printf '%s' "$DOCS_HTML" | grep -q "$CID" && ok "租户文档填入真实 Client ID" || bad "文档缺真实 Client ID"
+printf '%s' "$DOCS_HTML" | grep -q "已按你的租户自动填入" && ok "文档页提示已填真实值" || bad "文档页缺已填提示"
+printf '%s' "$DOCS_D1" | grep -q "dt-mock-secret" && bad "文档页泄漏了钉钉 AppSecret" || ok "文档页无敏感凭证泄漏"
+GEN_HTML=$(curl -s $RESOLVE_CHECK "http://deploy-check.sso.example.com:8787/docs/2-cloudflare-access")
+printf '%s' "$GEN_HTML" | grep -q "acme.sso.example.com" && ok "管理入口文档显示示例值" || bad "管理入口文档缺示例值"
+printf '%s' "$GEN_HTML" | grep -q "$CID" && bad "管理入口文档泄漏了租户 Client ID" || ok "管理入口文档不泄漏租户信息"
+DOCS_MD=$(curl -s $RESOLVE "$W/docs/2-cloudflare-access.md")
+check "markdown 版 Auth URL 已替换" "$(printf '%s' "$DOCS_MD" | grep -c '{{' || true)" "0"
+printf '%s' "$DOCS_MD" | grep -q 'https://demo.sso.example.com/authorize' && ok "markdown 版含真实 Auth URL" || bad "markdown 版缺真实 Auth URL"
+code=$(curl -s -o /dev/null -w '%{http_code}' $RESOLVE "$W/docs/3-troubleshooting")
+check "其他文档页 → 200" "$code" "200"
+code=$(curl -s -o /dev/null -w '%{http_code}' $RESOLVE "$W/docs/nonexist-page")
+check "未知文档页 → 404" "$code" "404"
+code=$(curl -s -o /dev/null -w '%{http_code}' $RESOLVE "$W/docs/marked.min.js")
+check "渲染库静态文件 → 200" "$code" "200"
+
 echo ""
 echo "════════════════════════════"
 echo "结果: PASS=$PASS FAIL=$FAIL"

@@ -7,16 +7,16 @@
 1. 打开 [Cloudflare Zero Trust 控制台](https://one.dash.cloudflare.com)，选择你的 team
 2. **Integrations → Identity providers**（或 Settings → Authentication → Login methods，不同版本入口略有差异）
 3. **Add new → 选 OpenID Connect**
-4. 五个字段填写（把 `<slug>`、`<服务域名>` 换成运营给你的租户地址）：
+4. 五个字段填写（从你的租户地址打开本文档时，URL 和 Client ID 已自动填好；Client Secret 找运营拿）：
 
 | 字段 | 值 |
 |---|---|
 | **Name** | `DingTalk`（随意，显示在登录按钮上） |
-| **Client ID** | 运营给的 client_id |
-| **Client secret** | 运营给的 client_secret |
-| **Auth URL** | `https://<slug>.sso.<服务域名>/authorize` |
-| **Token URL** | `https://<slug>.sso.<服务域名>/token` |
-| **Certificate URL** | `https://<slug>.sso.<服务域名>/jwks` |
+| **Client ID** | `{{CLIENT_ID}}` |
+| **Client secret** | 运营给你的 client_secret（可随时让运营重新生成） |
+| **Auth URL** | `{{AUTH_URL}}` |
+| **Token URL** | `{{TOKEN_URL}}` |
+| **Certificate URL** | `{{JWKS_URL}}` |
 
 5. **可选项全部保持默认**：
    - **PKCE 不要开**（本服务不支持，开了会登录失败）

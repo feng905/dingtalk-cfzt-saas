@@ -85,6 +85,8 @@ curl -s -H "$T" .../admin/tenants/acme/logs?limit=50                      # 登�
 
 客户侧图文文档在 [docs/](docs/README.md)：[① 钉钉建应用](docs/1-dingtalk-app.md) →
 [② CF ZT 五字段配置](docs/2-cloudflare-access.md) → [③ 排错对照表](docs/3-troubleshooting.md)。
+**在线版**：租户开通后让客户从自己的租户地址打开 `https://<slug>.sso.<服务域名>/docs`，
+文档中的回调地址、OIDC URL 和 Client ID 会按租户自动填入真实值（无需手工替换占位符）。
 
 流程概要：
 
