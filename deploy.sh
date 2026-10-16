@@ -497,7 +497,7 @@ elif confirm "配置 Worker 自动开通租户域名？（推荐；需创建一�
       TRY=$((TRY + 1))
       sleep 5
     done
-    if printf '%s' "$TOKEN_JSON" | grep -q '"success":true'; then
+    if printf '%s' "$TOKEN_JSON" | grep -Eq '"success"[[:space:]]*:[[:space:]]*true'; then
       ok "Token 校验通过"
     else
       die "Token 校验失败（确认粘贴完整）: ${TOKEN_JSON:-<无响应>}"
@@ -510,7 +510,7 @@ elif confirm "配置 Worker 自动开通租户域名？（推荐；需创建一�
       TRY=$((TRY + 1))
       sleep 5
     done
-    if printf '%s' "$DOM_JSON" | grep -q '"success":true'; then
+    if printf '%s' "$DOM_JSON" | grep -Eq '"success"[[:space:]]*:[[:space:]]*true'; then
       ok "Workers 域名 API 可用（权限足够）"
     else
       die "域名 API 不可用（确认权限 Account→Workers Scripts→Edit 且区域资源含 ${DOMAIN}）: ${DOM_JSON:-<无响应>}"
